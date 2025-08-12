@@ -1,264 +1,372 @@
-# can_cli_command_sender_gui.py
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
 """
-GUI sender for CLI-over-CAN FD using PCANBasic.
-- Frame format: [HDR(1)] + [PAYLOAD(63)] = 64B (FD DLC=15)
-  * HDR bit7: 1=LAST, 0=MIDDLE
-  * HDR bit6..0: MIDDLE→SEQ(0..127), LAST→last_len(1..63)
+can_cli_command_sender_gui.py
+- PyQt6 GUI for CAN CLI
+- Backend: can_cli_command_sender.py (uses pcan_manager.PCANManager under the hood)
+- 프레이밍/조립은 전부 백엔드에서 처리. GUI는 표시/전송/파일/REPL만 담당.
+
+필요 패키지:
+    pip install PyQt6
 """
 
 from __future__ import annotations
+from typing import List, Optional
 
-import threading
-import tkinter as tk
-from tkinter import ttk, messagebox, filedialog
-from PCANBasic import *  # TPCANMsgFD, PCAN_USBBUS*, PCAN_ERROR_*, etc.
-from pcan_manager import make_fd_msg, write_fd_blocking
-
-CHUNK = 63
-
-DEFAULT_BITRATE_FD = (
-    "f_clock=80000000,"
-    "nom_brp=2,nom_tseg1=33,nom_tseg2=6,nom_sjw=1,"
-    "data_brp=2,data_tseg1=6,data_tseg2=1,data_sjw=1,data_ssp_offset=14"
+import sys
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QObject, QEvent
+from PyQt6.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QFileDialog, QMessageBox,
+    QTextEdit, QPushButton, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit,
+    QCheckBox, QProgressBar, QSplitter, QListWidget, QListWidgetItem, QGroupBox
 )
 
-
-def iter_canfd_frames(cmd: str, chunk: int = CHUNK):
-    """63B씩 분할. 마지막 프레임: last_len(1..63)+0패딩."""
-    # 장치에서 ASCII 기대라면 ascii 고정. (필요시 utf-8로 바꿔도 됨)
-    payload = cmd.encode("ascii", errors="ignore")
-    n = len(payload)
-    if n == 0:
-        return
-    pos = 0
-    seq = 0
-    while (n - pos) > chunk:
-        hdr = seq & 0x7F  # MIDDLE
-        frame = bytes([hdr]) + payload[pos:pos + chunk]
-        assert len(frame) == 1 + chunk == 64
-        yield frame
-        pos += chunk
-        seq = (seq + 1) & 0x7F
-
-    last_len = n - pos
-    if last_len <= 0 or last_len > chunk:
-        last_len = chunk
-    hdr = 0x80 | (last_len & 0x7F)  # LAST
-    pad = bytes(chunk - last_len)
-    frame = bytes([hdr]) + payload[pos:pos + last_len] + pad
-    assert len(frame) == 1 + chunk == 64
-    yield frame
+# -------- Backend 고정 import --------
+try:
+    import can_cli_command_sender as backend  # must provide: connect/disconnect/send_line/send_lines/start_repl/stop_repl
+    _be_err = None
+except Exception as e:
+    backend = None
+    _be_err = e
 
 
-def resolve_channel(name: str):
-    """문자열 채널명을 PCAN 상수로 변환."""
-    try:
-        return globals()[name]
-    except KeyError:
-        return PCAN_USBBUS1
+# -------- 송신 작업 스레드 --------
+class SendWorker(QThread):
+    progress = pyqtSignal(int)
+    lineSent = pyqtSignal(str)
+    error = pyqtSignal(str)
+    finishedOk = pyqtSignal()
+
+    def __init__(self, lines: List[str]):
+        super().__init__()
+        self.lines = lines
+        self._stop = False
+
+    def run(self):
+        try:
+            total = len(self.lines)
+            # 배치 먼저 시도
+            try:
+                backend.send_lines(self.lines)  # type: ignore[attr-defined]
+                for i, line in enumerate(self.lines, 1):
+                    if self._stop:
+                        break
+                    self.lineSent.emit(line)
+                    self.progress.emit(int(i * 100 / max(1, total)))
+                self.finishedOk.emit()
+                return
+            except Exception:
+                pass
+
+            # 단건 루프
+            for i, line in enumerate(self.lines, 1):
+                if self._stop:
+                    break
+                backend.send_line(line)  # type: ignore[attr-defined]
+                self.lineSent.emit(line)
+                self.progress.emit(int(i * 100 / max(1, total)))
+            self.finishedOk.emit()
+        except Exception as e:
+            self.error.emit(str(e))
+
+    def stop(self):
+        self._stop = True
 
 
-class CanCliSenderGUI(tk.Tk):
+# -------- REPL 수신 신호 브리지 (스레드→UI) --------
+class ReplBridge(QObject):
+    rxText = pyqtSignal(str, int)  # text, can_id
+
+
+class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.title("CAN-FD CLI Sender (PCAN)")
-        self.geometry("900x600")
+        self.setWindowTitle("CAN CLI Command Sender (PyQt6)")
+        self.resize(1180, 820)
 
-        self._pcan = None
-        self._channel = PCAN_USBBUS1
-        self._is_std = True
-        self._use_brs = True
-        self._ifg_us = 1500
-        self._max_retry = 100
-        self._bitrate_fd = DEFAULT_BITRATE_FD
-        self._canid = 0xC0
+        if backend is None:
+            QMessageBox.critical(self, "오류", f"백엔드(can_cli_command_sender) import 실패: {_be_err}")
 
-        self._build_widgets()
+        self.worker: Optional[SendWorker] = None
 
-    # ------------- UI -------------
-    def _build_widgets(self):
-        frm_top = ttk.LabelFrame(self, text="Connection / Options")
-        frm_top.pack(fill="x", padx=8, pady=6)
+        # ---------------- 상단: 연결 설정 ----------------
+        self.edChannel = QLineEdit("PCAN_USBBUS1")
+        self.edBitrate = QLineEdit(
+            "f_clock=80000000,nom_brp=2,nom_tseg1=33,nom_tseg2=6,nom_sjw=1,"
+            "data_brp=2,data_tseg1=6,data_tseg2=1,data_sjw=1,data_ssp_offset=14"
+        )
+        self.btnConnect = QPushButton("Connect")
+        self.btnDisconnect = QPushButton("Disconnect")
+        self.btnDisconnect.setEnabled(False)
 
-        # Channel
-        ttk.Label(frm_top, text="Channel:").grid(row=0, column=0, padx=6, pady=4, sticky="e")
-        self.cbo_channel = ttk.Combobox(frm_top, width=16, state="readonly",
-                                        values=[f"PCAN_USBBUS{i}" for i in range(1, 9)])
-        self.cbo_channel.current(0)
-        self.cbo_channel.grid(row=0, column=1, padx=6, pady=4, sticky="w")
+        row = QHBoxLayout()
+        row.addWidget(QLabel("Channel"))
+        row.addWidget(self.edChannel)
+        row.addSpacing(10)
+        row.addWidget(QLabel("BitrateFD"))
+        row.addWidget(self.edBitrate)
+        row.addStretch(1)
+        row.addWidget(self.btnConnect)
+        row.addWidget(self.btnDisconnect)
 
-        # CAN ID
-        ttk.Label(frm_top, text="CAN ID:").grid(row=0, column=2, padx=6, pady=4, sticky="e")
-        self.ent_canid = ttk.Entry(frm_top, width=10)
-        self.ent_canid.insert(0, "0xC0")
-        self.ent_canid.grid(row=0, column=3, padx=6, pady=4, sticky="w")
+        gbConn = QGroupBox("Connection (pcan_manager → can_cli_command_sender)")
+        layConn = QVBoxLayout()
+        layConn.addLayout(row)
+        gbConn.setLayout(layConn)
 
-        # Extended / BRS
-        self.var_ext = tk.BooleanVar(value=False)
-        self.var_brs = tk.BooleanVar(value=True)
-        ttk.Checkbutton(frm_top, text="Extended (29-bit)", variable=self.var_ext).grid(row=0, column=4, padx=6, pady=4)
-        ttk.Checkbutton(frm_top, text="Use BRS", variable=self.var_brs).grid(row=0, column=5, padx=6, pady=4)
+        # ---------------- 중앙: 좌(리스트) / 우(에디터) ----------------
+        self.listLines = QListWidget()
+        self.textEditor = QTextEdit()
+        self.textEditor.setPlaceholderText("여기에 명령을 입력하거나, 파일을 열어 미리보세요. (%, 공백은 스킵 옵션 적용)")
 
-        # IFG / Retry
-        ttk.Label(frm_top, text="IFG (us):").grid(row=1, column=0, padx=6, pady=4, sticky="e")
-        self.ent_ifg = ttk.Entry(frm_top, width=10)
-        self.ent_ifg.insert(0, "1500")
-        self.ent_ifg.grid(row=1, column=1, padx=6, pady=4, sticky="w")
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        splitter.addWidget(self.listLines)
+        splitter.addWidget(self.textEditor)
+        splitter.setStretchFactor(1, 1)
 
-        ttk.Label(frm_top, text="Max Retry:").grid(row=1, column=2, padx=6, pady=4, sticky="e")
-        self.ent_retry = ttk.Entry(frm_top, width=10)
-        self.ent_retry.insert(0, "100")
-        self.ent_retry.grid(row=1, column=3, padx=6, pady=4, sticky="w")
+        # ---------------- 옵션/버튼 ----------------
+        self.chkSkipComment = QCheckBox("주석(%) 스킵"); self.chkSkipComment.setChecked(True)
+        self.chkSkipEmpty = QCheckBox("공백 스킵"); self.chkSkipEmpty.setChecked(True)
 
-        # Bitrate FD
-        ttk.Label(frm_top, text="Bitrate FD:").grid(row=2, column=0, padx=6, pady=4, sticky="e")
-        self.ent_bitrate = ttk.Entry(frm_top, width=80)
-        self.ent_bitrate.insert(0, DEFAULT_BITRATE_FD)
-        self.ent_bitrate.grid(row=2, column=1, columnspan=5, padx=6, pady=4, sticky="w")
+        self.btnOpen = QPushButton("파일 열기")
+        self.btnSendAll = QPushButton("전체 전송")
+        self.btnSendSelected = QPushButton("선택 전송")
+        self.btnStop = QPushButton("중지"); self.btnStop.setEnabled(False)
+        self.btnClear = QPushButton("로그 지우기")
 
-        # Buttons
-        self.btn_connect = ttk.Button(frm_top, text="Connect", command=self.on_connect)
-        self.btn_disconnect = ttk.Button(frm_top, text="Disconnect", command=self.on_disconnect, state="disabled")
-        self.btn_connect.grid(row=0, column=6, padx=6, pady=4, sticky="w")
-        self.btn_disconnect.grid(row=1, column=6, padx=6, pady=4, sticky="w")
+        optRow = QHBoxLayout()
+        optRow.addWidget(self.chkSkipComment)
+        optRow.addWidget(self.chkSkipEmpty)
+        optRow.addStretch(1)
+        optRow.addWidget(self.btnOpen)
+        optRow.addWidget(self.btnSendSelected)
+        optRow.addWidget(self.btnSendAll)
+        optRow.addWidget(self.btnStop)
+        optRow.addWidget(self.btnClear)
 
-        # Command panel
-        frm_cmd = ttk.LabelFrame(self, text="Command")
-        frm_cmd.pack(fill="both", expand=True, padx=8, pady=6)
+        # ---------------- 진행/로그 ----------------
+        self.progress = QProgressBar(); self.progress.setRange(0, 100)
+        self.log = QTextEdit(); self.log.setReadOnly(True)
 
-        self.txt_cmd = tk.Text(frm_cmd, height=8)
-        self.txt_cmd.pack(fill="both", expand=True, padx=6, pady=6)
+        # ---------------- REPL 콘솔 ----------------
+        self.console = QTextEdit(); self.console.setReadOnly(True)
+        self.console.setPlaceholderText("REPL 콘솔 출력 (장치 응답 표시: 프레이밍 조립 완료 문자열)")
+        self.consoleInput = QLineEdit()
+        self.consoleInput.setPlaceholderText("REPL 명령 입력 후 Enter.  ↑/↓: 히스토리,  Ctrl+L: 콘솔 클리어")
+        self.hist: List[str] = []
+        self.hidx: int = 0
 
-        frm_cmd_opts = ttk.Frame(frm_cmd)
-        frm_cmd_opts.pack(fill="x", padx=6, pady=2)
+        # 브리지(스레드→UI)
+        self.replBridge = ReplBridge()
+        self.replBridge.rxText.connect(self._on_repl_rx_text)
 
-        self.var_split = tk.BooleanVar(value=True)
-        ttk.Checkbutton(frm_cmd_opts, text="Send each line separately", variable=self.var_split).pack(side="left", padx=4)
+        # ---------------- 레이아웃 구성 ----------------
+        central = QWidget()
+        root = QVBoxLayout(central)
+        root.addWidget(gbConn)
+        root.addWidget(splitter, 1)
+        root.addLayout(optRow)
+        root.addWidget(self.progress)
+        root.addWidget(self.log, 1)
+        root.addWidget(self.console, 1)
+        root.addWidget(self.consoleInput)
+        self.setCentralWidget(central)
 
-        ttk.Button(frm_cmd_opts, text="Load From File...", command=self.on_load_file).pack(side="left", padx=4)
-        ttk.Button(frm_cmd_opts, text="Clear", command=lambda: self.txt_cmd.delete("1.0", "end")).pack(side="left", padx=4)
-        self.btn_send = ttk.Button(frm_cmd_opts, text="Send", command=self.on_send, state="disabled")
-        self.btn_send.pack(side="right", padx=4)
+        # ---------------- 시그널 연결 ----------------
+        self.btnOpen.clicked.connect(self.on_open)
+        self.btnSendAll.clicked.connect(self.on_send_all)
+        self.btnSendSelected.clicked.connect(self.on_send_selected)
+        self.btnStop.clicked.connect(self.on_stop)
+        self.btnClear.clicked.connect(self.log.clear)
+        self.btnConnect.clicked.connect(self.on_connect)
+        self.btnDisconnect.clicked.connect(self.on_disconnect)
 
-        # Log
-        frm_log = ttk.LabelFrame(self, text="Log")
-        frm_log.pack(fill="both", expand=True, padx=8, pady=6)
-        self.txt_log = tk.Text(frm_log, height=12, state="disabled")
-        self.txt_log.pack(fill="both", expand=True, padx=6, pady=6)
+        self.consoleInput.returnPressed.connect(self.on_repl_enter)
+        self.consoleInput.installEventFilter(self)
 
-        self.protocol("WM_DELETE_WINDOW", self.on_close)
+    # ================= 유틸 =================
+    def _filter_lines(self, lines: List[str]) -> List[str]:
+        out = []
+        for s in lines:
+            t = s.rstrip("\r\n")
+            if self.chkSkipEmpty.isChecked() and not t.strip():
+                continue
+            if self.chkSkipComment.isChecked() and t.lstrip().startswith("%"):
+                continue
+            out.append(t)
+        return out
 
-    # ------------- Connection -------------
-    def on_connect(self):
-        if self._pcan is not None:
-            return
-        try:
-            self._channel = resolve_channel(self.cbo_channel.get())
-            self._canid = int(self.ent_canid.get(), 0)
-            self._is_std = not self.var_ext.get()
-            self._use_brs = self.var_brs.get()
-            self._ifg_us = int(self.ent_ifg.get())
-            self._max_retry = int(self.ent_retry.get())
-            self._bitrate_fd = self.ent_bitrate.get().strip()
+    def _append_log(self, msg: str):
+        self.log.append(msg)
 
-            pcan = PCANBasic()
-            bitrate_fd = TPCANBitrateFD(self._bitrate_fd.encode("ascii"))
-            st = pcan.InitializeFD(self._channel, bitrate_fd)
-            if st != PCAN_ERROR_OK:
-                raise RuntimeError(f"InitializeFD failed: 0x{int(st):X}")
+    def _err(self, msg: str):
+        QMessageBox.critical(self, "오류", msg)
 
-            self._pcan = pcan
-            self._set_connected(True)
-            self._log("[OK] Connected")
-        except Exception as e:
-            self._log(f"[ERR] {e}")
-            messagebox.showerror("Connect Error", str(e))
-
-    def on_disconnect(self):
-        if self._pcan is None:
-            return
-        try:
-            self._pcan.Uninitialize(PCAN_NONEBUS)
-        except Exception:
-            pass
-        self._pcan = None
-        self._set_connected(False)
-        self._log("[OK] Disconnected")
-
-    def _set_connected(self, connected: bool):
-        self.btn_connect.config(state="disabled" if connected else "normal")
-        self.btn_disconnect.config(state="normal" if connected else "disabled")
-        self.btn_send.config(state="normal" if connected else "disabled")
-        self.cbo_channel.config(state="disabled" if connected else "readonly")
-        self.ent_canid.config(state="disabled" if connected else "normal")
-        self.ent_bitrate.config(state="disabled" if connected else "normal")
-        self.ent_ifg.config(state="disabled" if connected else "normal")
-        self.ent_retry.config(state="disabled" if connected else "normal")
-        # Extended/BRS는 연결 중에도 토글할 수 있게 둠
-        # self.var_ext / self.var_brs are always enabled
-
-    # ------------- Sending -------------
-    def on_send(self):
-        if self._pcan is None:
-            messagebox.showwarning("Not Connected", "Please connect first.")
-            return
-
-        text = self.txt_cmd.get("1.0", "end").strip("\n")
-        if not text.strip():
-            return
-
-        if self.var_split.get():
-            cmds = [ln.strip() for ln in text.splitlines() if ln.strip()]
-        else:
-            cmds = [text.strip()]
-
-        # 전송은 백그라운드 스레드에서
-        threading.Thread(target=self._send_worker, args=(cmds,), daemon=True).start()
-
-    def _send_worker(self, cmds):
-        try:
-            for cmd in cmds:
-                for frame in iter_canfd_frames(cmd, CHUNK):
-                    msg = make_fd_msg(self._canid, frame, is_std=self._is_std, use_brs=self._use_brs)
-                    write_fd_blocking(self._pcan, self._channel, msg,
-                                      ifg_us=self._ifg_us, max_retry=self._max_retry)
-                self._log(f"[TX] {cmd}")
-        except Exception as e:
-            self._log(f"[ERR] {e}")
-
-    # ------------- Helpers -------------
-    def on_load_file(self):
-        path = filedialog.askopenfilename(
-            title="Open text file",
-            filetypes=[("Text files", "*.txt"), ("All files", "*.*")]
+    # ================= 파일 열기 =================
+    def on_open(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "명령 파일 선택", "", "Text files (*.txt *.cfg *.cmd *.conf);;All files (*.*)"
         )
         if not path:
             return
         try:
             with open(path, "r", encoding="utf-8") as f:
                 content = f.read()
-            self.txt_cmd.delete("1.0", "end")
-            self.txt_cmd.insert("1.0", content)
-        except Exception as e:
-            messagebox.showerror("File Error", str(e))
+        except UnicodeDecodeError:
+            with open(path, "r", encoding="cp949", errors="ignore") as f:
+                content = f.read()
 
-    def _log(self, msg: str):
-        self.txt_log.config(state="normal")
-        self.txt_log.insert("end", msg + "\n")
-        self.txt_log.see("end")
-        self.txt_log.config(state="disabled")
+        self.textEditor.setPlainText(content)
+        self.listLines.clear()
+        for line in self._filter_lines(content.splitlines()):
+            self.listLines.addItem(QListWidgetItem(line))
+        self._append_log(f"[INFO] 파일 로드: {path}")
 
-    def on_close(self):
+    # ================= Connect/Disconnect =================
+    def on_connect(self):
+        if backend is None:
+            self._err(f"백엔드 import 실패: {_be_err}")
+            return
         try:
-            if self._pcan is not None:
-                self._pcan.Uninitialize(PCAN_NONEBUS)
+            backend.connect(self.edChannel.text().strip(), self.edBitrate.text().strip())
+            # REPL 수신 시작: 백엔드에서 조립된 텍스트 단위로 콜백됨
+            def _on_rx(text: str, can_id: int):
+                self.replBridge.rxText.emit(text, can_id)
+
+            if hasattr(backend, "start_repl"):
+                backend.start_repl(_on_rx)  # type: ignore[attr-defined]
+            self.btnConnect.setEnabled(False)
+            self.btnDisconnect.setEnabled(True)
+            self.statusBar().showMessage("Connected")
+            self._append_log("[INFO] 연결 완료")
+        except Exception as e:
+            self._err(str(e))
+
+    def on_disconnect(self):
+        if backend is None:
+            return
+        try:
+            if hasattr(backend, "stop_repl"):
+                try:
+                    backend.stop_repl()  # type: ignore[attr-defined]
+                except Exception:
+                    pass
+            backend.disconnect()  # type: ignore[attr-defined]
+            self.btnConnect.setEnabled(True)
+            self.btnDisconnect.setEnabled(False)
+            self.statusBar().showMessage("Disconnected")
+            self._append_log("[INFO] 연결 해제")
+        except Exception as e:
+            self._err(str(e))
+
+    # ================= 전송 =================
+    def _start_send(self, lines: List[str]):
+        if backend is None:
+            self._err(f"백엔드 import 실패: {_be_err}")
+            return
+        if not lines:
+            self._append_log("[WARN] 전송할 라인이 없습니다.")
+            return
+        self.progress.setValue(0)
+        self.btnSendAll.setEnabled(False)
+        self.btnSendSelected.setEnabled(False)
+        self.btnStop.setEnabled(True)
+
+        self.worker = SendWorker(lines)
+        self.worker.progress.connect(self.progress.setValue)
+        self.worker.lineSent.connect(lambda s: self._append_log(f"[TX] {s}"))
+        self.worker.error.connect(self._on_worker_error)
+        self.worker.finishedOk.connect(self._on_worker_done)
+        self.worker.start()
+
+    def _on_worker_error(self, msg: str):
+        self._append_log(f"[ERR] {msg}")
+        self._reset_buttons()
+
+    def _on_worker_done(self):
+        self._append_log("[INFO] 전송 완료]")
+        self._reset_buttons()
+
+    def _reset_buttons(self):
+        self.btnSendAll.setEnabled(True)
+        self.btnSendSelected.setEnabled(True)
+        self.btnStop.setEnabled(False)
+        self.progress.setValue(100)
+        self.worker = None
+
+    def on_send_all(self):
+        lines = self._filter_lines(self.textEditor.toPlainText().splitlines())
+        self._start_send(lines)
+
+    def on_send_selected(self):
+        sel = self.listLines.selectedItems()
+        if sel:
+            lines = [it.text() for it in sel]
+        else:
+            cursor = self.textEditor.textCursor()
+            lines = [cursor.block().text()]
+        self._start_send(self._filter_lines(lines))
+
+    def on_stop(self):
+        if self.worker is not None:
+            self.worker.stop()
+            self._append_log("[INFO] 중지 요청됨")
+
+    # ================= REPL 콘솔 =================
+    def _on_repl_rx_text(self, text: str, can_id: int):
+        # 백엔드에서 프레이밍 조립 완료된 한 덩어리 문자열이 들어옵니다.
+        self.console.append(f"[{hex(can_id)}] {text}")
+
+    def on_repl_enter(self):
+        if backend is None:
+            return
+        cmd = self.consoleInput.text().strip()
+        if not cmd:
+            return
+        # 히스토리
+        self.hist.append(cmd)
+        self.hidx = len(self.hist)
+        # 에코
+        self.console.append(f">>> {cmd}")
+        # 전송 (빠른 동기 호출; 무거우면 QThread 재사용 가능)
+        try:
+            backend.send_line(cmd)  # type: ignore[attr-defined]
+        except Exception as e:
+            self.console.append(f"[ERR] {e}")
         finally:
-            self.destroy()
+            self.consoleInput.clear()
+
+    # ↑/↓ 히스토리, Ctrl+L 클리어
+    def eventFilter(self, obj, ev):
+        if obj is self.consoleInput and ev.type() == QEvent.Type.KeyPress:
+            key = ev.key()
+            mod = ev.modifiers()
+            if key == Qt.Key.Key_L and (mod & Qt.KeyboardModifier.ControlModifier):
+                self.console.clear()
+                self.consoleInput.clear()
+                return True
+            if key == Qt.Key.Key_Up:
+                if self.hist:
+                    self.hidx = max(0, self.hidx - 1)
+                    self.consoleInput.setText(self.hist[self.hidx])
+                return True
+            if key == Qt.Key.Key_Down:
+                if self.hist:
+                    self.hidx = min(len(self.hist), self.hidx + 1)
+                    if self.hidx == len(self.hist):
+                        self.consoleInput.clear()
+                    else:
+                        self.consoleInput.setText(self.hist[self.hidx])
+                return True
+        return super().eventFilter(obj, ev)
 
 
 def main():
-    app = CanCliSenderGUI()
-    app.mainloop()
+    app = QApplication(sys.argv)
+    w = MainWindow()
+    w.show()
+    sys.exit(app.exec())
 
 
 if __name__ == "__main__":
