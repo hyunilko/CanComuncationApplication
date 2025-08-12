@@ -1,4 +1,3 @@
-# can_cli_command_sender.py
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """

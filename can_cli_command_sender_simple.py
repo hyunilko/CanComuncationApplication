@@ -1,3 +1,5 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 # can_cli_command_sender_simple.py
 
 import argparse
