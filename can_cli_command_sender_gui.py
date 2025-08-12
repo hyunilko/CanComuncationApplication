@@ -7,7 +7,7 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
 
-from can_cli_command_sender import CanDataSender, load_commands_from_file
+from can_cli_command_sender import CanCliCommandSender, load_commands_from_file
 from pcan_manager import PCANManager
 
 class SendThread(QThread):
@@ -21,7 +21,7 @@ class SendThread(QThread):
 
     def run(self):
         for idx, cmd in enumerate(self.commands):
-            result = self.sender.send_long_command(cmd)
+            result = self.sender.send(cmd)
             self.update_status.emit(idx, cmd, result)
             self.msleep(120)
         self.finished.emit()
@@ -32,10 +32,9 @@ class SenderGui(QWidget):
         self.setWindowTitle("Configuration Selection")
         self.resize(440, 340)
 
-        # CAN 객체
         self.pcan_manager = PCANManager()
         self.pcan_manager.initialize()
-        self.sender = CanDataSender(self.pcan_manager)
+        self.sender = CanCliCommandSender(self.pcan_manager)
         self.commands = []
         self.file_path = ""
 

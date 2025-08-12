@@ -7,7 +7,7 @@ import time
 import os
 
 
-class RadarConfigTool:
+class CanCliCommandSender:
     def __init__(self, channel=PCAN_USBBUS1,
                  bitrate_fd="f_clock=80000000,nom_brp=2,nom_tseg1=33,nom_tseg2=6,nom_sjw=1,data_brp=2,data_tseg1=6,data_tseg2=1,data_sjw=1,data_ssp_offset=14"):
         self.pcan = PCANBasic()
@@ -147,24 +147,24 @@ def main():
     args = parser.parse_args()
 
     try:
-        tool = RadarConfigTool()
+        sender = CanCliCommandSender()
 
         if args.interactive or not (args.command or args.file or args.all):
-            tool.interactive_mode()
+            sender.interactive_mode()
         elif args.command:
-            tool.send_command(args.command)
+            sender.send_command(args.command)
         elif args.file:
             commands = load_commands_from_file(args.file)
-            tool.send_config_sequence(commands)
+            sender.send_config_sequence(commands)
         elif args.all:
-            tool.send_config_sequence(default_configs)
+            sender.send_config_sequence(default_configs)
 
-        tool.close()
+        sender.close()
 
     except Exception as e:
         print(f"Error: {str(e)}")
-        if 'tool' in locals():
-            tool.close()
+        if 'sender' in locals():
+            sender.close()
         sys.exit(1)
 
 

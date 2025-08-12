@@ -1,141 +1,177 @@
-# can_data_sender.py
+# can_cli_command_sender.py
+"""
+- 초기화 1회 후, COMMAND 프롬프트를 계속 유지하며 반복 전송
+- 프레임 포맷: [HDR(1)] + [PAYLOAD(63)] = 64B (FD DLC=15)
+  * HDR bit7: 1=LAST, 0=MIDDLE
+  * HDR bit6..0: MIDDLE→SEQ(0..127), LAST→last_len(1..63)
+- 'exit'/'quit'/'q'/' .exit' 또는 Ctrl+C 로 종료
+"""
+
+from __future__ import annotations
 
 import argparse
-import time
-import os
-from ctypes import c_ubyte
-from PCANBasic import TPCANMsgFD, PCAN_MESSAGE_FD, PCAN_MESSAGE_STANDARD, TPCANMessageType, PCAN_ERROR_OK
-from pcan_manager import PCANManager
+from PCANBasic import *  # PCAN-Basic Python wrapper (TPCANMsgFD, constants, etc.)
+from pcan_manager import make_fd_msg, write_fd_blocking
 
-CAN_ID = 0xC0
-CAN_FD_PAYLOAD = 64
+CHUNK = 63
 
-def load_commands_from_file(file_path):
-    if not os.path.exists(file_path):
-        raise FileNotFoundError(f"Configuration file not found: {file_path}")
-    with open(file_path, 'r') as f:
-        commands = [
-            line.strip()
-            for line in f
-            if line.strip() and not line.strip().startswith(('#', '%'))
-        ]
-    return commands
+DEFAULT_BITRATE_FD = (
+    "f_clock=80000000,"
+    "nom_brp=2,nom_tseg1=33,nom_tseg2=6,nom_sjw=1,"
+    "data_brp=2,data_tseg1=6,data_tseg2=1,data_sjw=1,data_ssp_offset=14"
+)
 
-class CanDataSender:
-    def __init__(self, pcan_manager: PCANManager):
-        self.pcan = pcan_manager.pcan
-        self.channel = pcan_manager.channel
 
-    def send_command(self, command: str):
-        data = command.encode('utf-8')
-        if len(data) > CAN_FD_PAYLOAD:
-            raise ValueError(f"Command too long for one CAN FD frame ({len(data)} > {CAN_FD_PAYLOAD})")
+class CanCliCommandSender:
+    def __init__(self,
+                 channel,
+                 canid: int,
+                 is_std: bool = True,
+                 use_brs: bool = True,
+                 ifg_us: int = 1500,
+                 max_retry: int = 100,
+                 bitrate_fd_str: str = DEFAULT_BITRATE_FD):
+        self.channel = channel
+        self.canid = canid
+        self.is_std = is_std
+        self.use_brs = use_brs
+        self.ifg_us = ifg_us
+        self.max_retry = max_retry
 
-        if len(data) < CAN_FD_PAYLOAD:
-            padding = b'\x00' * (CAN_FD_PAYLOAD - len(data))
-            payload = data + padding
-        else:
-            payload = data
+        self.pcan = PCANBasic()
+        bitrate_fd = TPCANBitrateFD(bitrate_fd_str.encode("ascii"))
+        st = self.pcan.InitializeFD(self.channel, bitrate_fd)
+        if st != PCAN_ERROR_OK:
+            raise RuntimeError(f"InitializeFD failed: 0x{int(st):X}")
 
-        msg = TPCANMsgFD()
-        msg.ID = CAN_ID
-        msg.MSGTYPE = TPCANMessageType(PCAN_MESSAGE_FD.value | PCAN_MESSAGE_STANDARD.value)
-        msg.DATA = (c_ubyte * CAN_FD_PAYLOAD).from_buffer_copy(payload)
-        msg.DLC = 15  # 64 bytes for CAN FD
+    def close(self):
+        self.pcan.Uninitialize(PCAN_NONEBUS)
 
-        result = self.pcan.WriteFD(self.channel, msg)
-        if result != PCAN_ERROR_OK:
-            error_text = self.pcan.GetErrorText(result)[1].decode('utf-8')
-            print(f"Send error: {error_text}")
-            return False
+    def send(self, cmd_line: str):
+        """한 줄의 CLI 문자열을 64바이트 FD 프레임들로 쪼개 전송"""
+        if not cmd_line:
+            return
+        for frame in self.iter_canfd_frames(cmd_line, CHUNK):
+            msg = make_fd_msg(self.canid, frame, is_std=self.is_std, use_brs=self.use_brs)
+            write_fd_blocking(self.pcan, self.channel, msg,
+                              ifg_us=self.ifg_us, max_retry=self.max_retry)
 
-        print(f"Command sent: '{command}' (len={len(data)})")
-        print(f"Padding with {'0' * (CAN_FD_PAYLOAD - len(data)) if len(data)<CAN_FD_PAYLOAD else ''}")
-        return True
-
-    def send_long_command(self, command: str):
-        data = command.encode('utf-8')
-        total_len = len(data)
-        seq = 0
+    @staticmethod
+    def iter_canfd_frames(cmd: str, chunk: int = CHUNK):
+        """앞에서부터 63Bytes씩 분할. 마지막 프레임은 last_len(1..63)+패딩."""
+        payload = cmd.encode("ascii")
+        n = len(payload)
+        if n == 0:
+            return
         pos = 0
-        max_payload = 63
+        seq = 0
+        while (n - pos) > chunk:
+            hdr = seq & 0x7F  # MIDDLE
+            frame = bytes([hdr]) + payload[pos:pos + chunk]
+            assert len(frame) == 1 + chunk == 64
+            yield frame
+            pos += chunk
+            seq = (seq + 1) & 0x7F
 
-        while pos < total_len:
-            chunk = data[pos:pos + max_payload]
-            is_last = (pos + max_payload >= total_len)  # 중요! 남은게 max_payload 이하일 때만 마지막
-            pbf = 1 if is_last else 0
+        last_len = n - pos
+        if last_len <= 0 or last_len > chunk:
+            last_len = chunk
+        hdr = 0x80 | (last_len & 0x7F)  # LAST
+        pad = bytes(chunk - last_len)
+        frame = bytes([hdr]) + payload[pos:pos + last_len] + pad
+        assert len(frame) == 1 + chunk == 64
+        yield frame
 
-            if not is_last:
-                seq_or_len = seq & 0x7F
-            else:
-                seq_or_len = len(chunk) & 0x7F
-                if seq_or_len == 0:
-                    # 길이 0 패킷 보내면 안 됨
-                    print("SKIP: Not sending empty last frame.")
-                    break
+    @staticmethod
+    def resolve_channel(name: str):
+        """문자열 채널명을 PCAN 상수로 변환."""
+        try:
+            return globals()[name]
+        except KeyError:
+            return PCAN_USBBUS1
 
-            header = ((pbf & 0x01) << 7) | (seq_or_len)
-            frame = bytes([header]) + chunk
-            frame += b'\x00' * (64 - len(frame))
-
-            msg = TPCANMsgFD()
-            msg.ID = CAN_ID
-            msg.MSGTYPE = TPCANMessageType(PCAN_MESSAGE_FD.value | PCAN_MESSAGE_STANDARD.value)
-            msg.DATA = (c_ubyte * 64).from_buffer_copy(frame)
-            msg.DLC = 15
-
-            result = self.pcan.WriteFD(self.channel, msg)
-            if result != PCAN_ERROR_OK:
-                error_text = self.pcan.GetErrorText(result)[1].decode('utf-8')
-                print(f"Send error (seq={seq}): {error_text}")
-                return False
-
-            pos += len(chunk)
-            seq += 1
-            time.sleep(0.01)
-        print("Command sent (multi-frame, PACKET_LAST seq_no=actual_data_len)")
-        return True
-
-    def send_config_sequence(self, commands):
-        for i, cmd in enumerate(commands, 1):
-            print(f"[{i}/{len(commands)}] Sending: {cmd}")
-            ok = self.send_command(cmd)
-            if ok:
-                print("Command sent successfully")
-            else:
-                print("Command sending failed")
-            time.sleep(0.1)
-
-    def interactive_mode(self):
-        print("Interactive mode (type 'exit' to quit)")
-        while True:
-            try:
-                cmd = input("COMMAND> ").strip()
-                if cmd.lower() == "exit": break
-                if cmd: self.send_long_command(cmd)
-            except KeyboardInterrupt:
-                print("\nTerminated"); break
 
 def main():
-    parser = argparse.ArgumentParser(description="CanDataSender (CAN FD 64 bytes, '0' padding)")
-    parser.add_argument("--command", help="Single command to send")
-    parser.add_argument("--file", help="Path to a file containing configuration commands")
-    parser.add_argument("--interactive", action="store_true", help="Interactive mode")
-    args = parser.parse_args()
+    ap = argparse.ArgumentParser( # REPL은 Read-Eval-Print Loop의 약자로, 프로그래밍 언어에서 코드를 대화형으로 실행할 수 있는 환경
+        description="Send CLI commands over CAN-FD via PCAN (REPL)."
+    )
+    # 첫 실행 시 보낼 초기 명령(옵션)
+    ap.add_argument("cmd", nargs="*", help="Initial CLI command tokens (optional)")
+    ap.add_argument("--cmd-str", help="Initial full command as one quoted string")
+    ap.add_argument("--from-file", help="Initial command read from a text file")
+    # 통신 옵션
+    ap.add_argument("--channel", default="PCAN_USBBUS1",
+                    help="PCAN channel name (e.g., PCAN_USBBUS1)")
+    ap.add_argument("--canid", type=lambda x: int(x, 0), default=0xC0,
+                    help="CAN ID (supports 0x..)")
+    ap.add_argument("--extended", action="store_true",
+                    help="Use 29-bit Extended ID (default: 11-bit Standard)")
+    ap.add_argument("--no-brs", action="store_true",
+                    help="Disable BRS (data phase at nominal rate)")
+    ap.add_argument("--ifg-us", type=int, default=1500,
+                    help="Inter-frame gap in microseconds")
+    ap.add_argument("--max-retry", type=int, default=100,
+                    help="Max retries when TX queue is full")
+    ap.add_argument("--bitrate-fd", default=DEFAULT_BITRATE_FD,
+                    help="PCAN FD bitrate string")
+    args = ap.parse_args()
 
-    pcan_manager = PCANManager()
-    pcan_manager.initialize()
+    channel = CanCliCommandSender.resolve_channel(args.channel)
+    is_std = not args.extended
+    use_brs = not args.no_brs
+
+    sender = None
     try:
-        sender = CanDataSender(pcan_manager)
-        if args.interactive or not (args.command or args.file):
-            sender.interactive_mode()
-        elif args.command:
-            sender.send_command(args.command)
-        elif args.file:
-            commands = load_commands_from_file(args.file)
-            sender.send_config_sequence(commands)
+        sender = CanCliCommandSender(channel=channel,
+                                     canid=args.canid,
+                                     is_std=is_std,
+                                     use_brs=use_brs,
+                                     ifg_us=args.ifg_us,
+                                     max_retry=args.max_retry,
+                                     bitrate_fd_str=args.bitrate_fd)
+
+        # 초기 명령 전송(있다면)
+        if args.cmd_str:
+            init_cmd = args.cmd_str.strip()
+        elif args.from_file:
+            with open(args.from_file, "r", encoding="utf-8") as f:
+                init_cmd = f.read().strip()
+        elif args.cmd:
+            init_cmd = " ".join(args.cmd).strip()
+        else:
+            init_cmd = ""
+
+        if init_cmd:
+            sender.send(init_cmd)
+            print("[OK] Sent (initial)")
+
+        # REPL
+        print("Enter CLI commands. Type 'exit'/'quit'/'q' to leave.")
+        while True:
+            try:
+                cmd_line = input("COMMAND> ").strip()
+            except KeyboardInterrupt:
+                print("\n^C")
+                break
+            except EOFError:
+                print()
+                break
+
+            if not cmd_line:
+                continue
+            if cmd_line.lower() in ("exit", "quit", "q", ".exit"):
+                break
+
+            try:
+                sender.send(cmd_line)
+                print("[OK] Sent")
+            except Exception as e:
+                print(f"[ERR] {e}")
+
     finally:
-        pcan_manager.close()
+        if sender is not None:
+            sender.close()
+
 
 if __name__ == "__main__":
     main()
