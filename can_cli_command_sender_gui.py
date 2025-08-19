@@ -4,7 +4,7 @@
 """
 can_cli_command_sender_gui.py
 - PyQt6 GUI for CAN CLI
-- Backend: can_cli_command_sender.py (uses pcan_manager.PCANManager under the hood)
+- Backend: can_cli_command_sender.CanCliCommandSender (pcan_manager.PCANManager 사용)
 - 프레이밍/조립은 전부 백엔드에서 처리. GUI는 표시/전송/파일/REPL만 담당.
 
 필요 패키지:
@@ -22,12 +22,12 @@ from PyQt6.QtWidgets import (
     QCheckBox, QProgressBar, QSplitter, QListWidget, QListWidgetItem, QGroupBox
 )
 
-# -------- Backend 고정 import --------
+# -------- Backend class import --------
 try:
-    import can_cli_command_sender as backend  # must provide: connect/disconnect/send_line/send_lines/start_repl/stop_repl
+    from can_cli_command_sender import CanCliCommandSender
     _be_err = None
 except Exception as e:
-    backend = None
+    CanCliCommandSender = None  # type: ignore
     _be_err = e
 
 
@@ -38,8 +38,9 @@ class SendWorker(QThread):
     error = pyqtSignal(str)
     finishedOk = pyqtSignal()
 
-    def __init__(self, lines: List[str]):
+    def __init__(self, sender: "CanCliCommandSender", lines: List[str]):
         super().__init__()
+        self.sender = sender
         self.lines = lines
         self._stop = False
 
@@ -48,7 +49,7 @@ class SendWorker(QThread):
             total = len(self.lines)
             # 배치 먼저 시도
             try:
-                backend.send_lines(self.lines)  # type: ignore[attr-defined]
+                self.sender.send_lines(self.lines)
                 for i, line in enumerate(self.lines, 1):
                     if self._stop:
                         break
@@ -57,13 +58,13 @@ class SendWorker(QThread):
                 self.finishedOk.emit()
                 return
             except Exception:
+                # 배치 실패 시 단건 전송으로 폴백
                 pass
 
-            # 단건 루프
             for i, line in enumerate(self.lines, 1):
                 if self._stop:
                     break
-                backend.send_line(line)  # type: ignore[attr-defined]
+                self.sender.send_line(line)
                 self.lineSent.emit(line)
                 self.progress.emit(int(i * 100 / max(1, total)))
             self.finishedOk.emit()
@@ -85,10 +86,11 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("CAN CLI Command Sender (PyQt6)")
         self.resize(1180, 820)
 
-        if backend is None:
+        if CanCliCommandSender is None:
             QMessageBox.critical(self, "오류", f"백엔드(can_cli_command_sender) import 실패: {_be_err}")
 
         self.worker: Optional[SendWorker] = None
+        self.sender: Optional["CanCliCommandSender"] = None
 
         # ---------------- 상단: 연결 설정 ----------------
         self.edChannel = QLineEdit("PCAN_USBBUS1")
@@ -110,7 +112,7 @@ class MainWindow(QMainWindow):
         row.addWidget(self.btnConnect)
         row.addWidget(self.btnDisconnect)
 
-        gbConn = QGroupBox("Connection (pcan_manager → can_cli_command_sender)")
+        gbConn = QGroupBox("Connection (pcan_manager → CanCliCommandSender)")
         layConn = QVBoxLayout()
         layConn.addLayout(row)
         gbConn.setLayout(layConn)
@@ -225,17 +227,22 @@ class MainWindow(QMainWindow):
 
     # ================= Connect/Disconnect =================
     def on_connect(self):
-        if backend is None:
+        if CanCliCommandSender is None:
             self._err(f"백엔드 import 실패: {_be_err}")
             return
         try:
-            backend.connect(self.edChannel.text().strip(), self.edBitrate.text().strip())
+            # 인스턴스 생성 및 연결
+            self.sender = CanCliCommandSender(
+                channel=self.edChannel.text().strip(),
+                bitrate_fd=self.edBitrate.text().strip(),
+            )
+            self.sender.connect()
+
             # REPL 수신 시작: 백엔드에서 조립된 텍스트 단위로 콜백됨
             def _on_rx(text: str, can_id: int):
                 self.replBridge.rxText.emit(text, can_id)
 
-            if hasattr(backend, "start_repl"):
-                backend.start_repl(_on_rx)  # type: ignore[attr-defined]
+            self.sender.start_repl(_on_rx)
             self.btnConnect.setEnabled(False)
             self.btnDisconnect.setEnabled(True)
             self.statusBar().showMessage("Connected")
@@ -244,15 +251,17 @@ class MainWindow(QMainWindow):
             self._err(str(e))
 
     def on_disconnect(self):
-        if backend is None:
-            return
         try:
-            if hasattr(backend, "stop_repl"):
+            if self.sender is not None:
                 try:
-                    backend.stop_repl()  # type: ignore[attr-defined]
+                    self.sender.stop_repl()
                 except Exception:
                     pass
-            backend.disconnect()  # type: ignore[attr-defined]
+                try:
+                    self.sender.disconnect()
+                except Exception:
+                    pass
+            self.sender = None
             self.btnConnect.setEnabled(True)
             self.btnDisconnect.setEnabled(False)
             self.statusBar().showMessage("Disconnected")
@@ -262,8 +271,8 @@ class MainWindow(QMainWindow):
 
     # ================= 전송 =================
     def _start_send(self, lines: List[str]):
-        if backend is None:
-            self._err(f"백엔드 import 실패: {_be_err}")
+        if self.sender is None:
+            self._err("연결되어 있지 않습니다. 먼저 Connect 하세요.")
             return
         if not lines:
             self._append_log("[WARN] 전송할 라인이 없습니다.")
@@ -273,7 +282,7 @@ class MainWindow(QMainWindow):
         self.btnSendSelected.setEnabled(False)
         self.btnStop.setEnabled(True)
 
-        self.worker = SendWorker(lines)
+        self.worker = SendWorker(self.sender, lines)
         self.worker.progress.connect(self.progress.setValue)
         self.worker.lineSent.connect(lambda s: self._append_log(f"[TX] {s}"))
         self.worker.error.connect(self._on_worker_error)
@@ -319,7 +328,8 @@ class MainWindow(QMainWindow):
         self.console.append(f"[{hex(can_id)}] {text}")
 
     def on_repl_enter(self):
-        if backend is None:
+        if self.sender is None:
+            self.console.append("[ERR] 연결되어 있지 않습니다.")
             return
         cmd = self.consoleInput.text().strip()
         if not cmd:
@@ -331,7 +341,7 @@ class MainWindow(QMainWindow):
         self.console.append(f">>> {cmd}")
         # 전송 (빠른 동기 호출; 무거우면 QThread 재사용 가능)
         try:
-            backend.send_line(cmd)  # type: ignore[attr-defined]
+            self.sender.send_line(cmd)
         except Exception as e:
             self.console.append(f"[ERR] {e}")
         finally:
@@ -360,6 +370,14 @@ class MainWindow(QMainWindow):
                         self.consoleInput.setText(self.hist[self.hidx])
                 return True
         return super().eventFilter(obj, ev)
+
+    # 창 닫을 때 안전 정리
+    def closeEvent(self, ev):
+        try:
+            self.on_disconnect()
+        except Exception:
+            pass
+        super().closeEvent(ev)
 
 
 def main():
