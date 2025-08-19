@@ -1,398 +1,403 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# can_data_receiver_simple.py
-"""
-프레이밍(SEQ/LAST) 규약을 적용하지 않는 '순수 프레임' 수신기.
-- PCANManager(class)로 링크를 열고,
-- PCANBasic.ReadFD를 직접 호출해 들어오는 프레임을 그대로 표시/덤프합니다.
 
-특징:
-- FD 전용(ReadFD만 사용). 클래식 Read()는 호출하지 않음.
-- 포그라운드 연속 수신(기본): 버스트 드레인 루프 + 라인 버퍼링
-- 백그라운드 스레드 모드(--bg), 단발 수신(--once)도 지원
+"""
+can_data_receiver_simple.py
+
+- PCANManager를 공용으로 사용하여 CAN FD 프레임(최대 64B) 연속 수신
+- 수신 시 hexdump 프린트 + 파일 저장(패킷 간 1줄 공백)
+- 다중 CAN ID 필터 지원(미지정(None) 시 전체 수신)
+- 콜백 기반(mgr.start_rx) 지원, 없으면 내부 폴링 스레드
+- 실행 시마다 "radar packet YYYY-MM-DD HH-mm-ss.log" 생성
+
+필요:
+    - pcan_manager.py (repo 기준, 동작 확인된 버전)
 """
 
 from __future__ import annotations
+from typing import Optional, Iterable, Tuple, Set, Callable, Any
 
-import argparse
+import os
+import re
 import sys
 import time
 import threading
-from typing import Optional, Callable
-
-from PCANBasic import PCAN_ERROR_OK, PCAN_ERROR_QRCVEMPTY
-from pcan_manager import PCANManager
+from datetime import datetime
 
 try:
-    from hexdump import hexdump  # 로컬 hexdump.py 있을 때 예쁜 출력
-except Exception:
-    hexdump = None
+    from pcan_manager import PCANManager
+except Exception as e:
+    PCANManager = None  # type: ignore
+    _pcan_import_err = e
 
-DEFAULT_CHANNEL = "PCAN_USBBUS1"
-DEFAULT_BITRATE_FD = (
-    "f_clock=80000000,"
-    "nom_brp=2,nom_tseg1=33,nom_tseg2=6,nom_sjw=1,"
-    "data_brp=2,data_tseg1=6,data_tseg2=1,data_sjw=1,"
-    "data_ssp_offset=14"
-)
 
-# CAN FD DLC → 바이트 길이 매핑(일부 래퍼는 DLC에 '바이트'를 바로 넣기도 함)
-_FD_DLC_TABLE = {
-    0: 0, 1: 1, 2: 2, 3: 3, 4: 4, 5: 5, 6: 6, 7: 7, 8: 8,
-    9: 12, 10: 16, 11: 20, 12: 24, 13: 32, 14: 48, 15: 64
+# -------------------- 유틸 --------------------
+_DLC_TO_LEN = {
+    0x0: 0,  0x1: 1,  0x2: 2,  0x3: 3,
+    0x4: 4,  0x5: 5,  0x6: 6,  0x7: 7,
+    0x8: 8,  0x9: 12, 0xA: 16, 0xB: 20,
+    0xC: 24, 0xD: 32, 0xE: 48, 0xF: 64,
 }
 
+def _length_from_msgfd(msg: Any) -> int:
+    # PCANBasic TPCANMsgFD는 구현에 따라 LEN이 없고 DLC만 있을 수 있음
+    if hasattr(msg, "LEN"):
+        try:
+            n = int(msg.LEN)
+            if 0 <= n <= 64:
+                return n
+        except Exception:
+            pass
+    if hasattr(msg, "DLC"):
+        try:
+            dlc = int(msg.DLC) & 0xF
+            return _DLC_TO_LEN.get(dlc, 64)
+        except Exception:
+            pass
+    if hasattr(msg, "DATA"):
+        try:
+            # ctypes 배열 길이 또는 파이썬 bytes/bytearray 길이
+            return min(len(msg.DATA), 64)
+        except Exception:
+            pass
+    return 64
 
-def _dump_bytes(prefix: str, b: bytes, quiet: bool):
-    if quiet:
-        return
-    if hexdump:
-        print(prefix)
-        hexdump(b)
-    else:
-        # hexdump 모듈이 없으면 간단 출력
-        print(prefix, b.hex())
+def _hexdump_lines(b: bytes) -> str:
+    lines = []
+    for i in range(0, len(b), 16):
+        chunk = b[i:i+16]
+        hexs = " ".join(f"{x:02X}" for x in chunk)
+        asci = "".join(chr(x) if 32 <= x <= 126 else "." for x in chunk)
+        lines.append(f"{i:04X}  {hexs:<47}  {asci}")
+    return "\n".join(lines)
+
+def _sanitize_windows_filename(name: str) -> str:
+    return re.sub(r'[<>:"/\\|?*]', '-', name)
+
+def _new_log_path(prefix: str, log_dir: str = ".") -> str:
+    ts = datetime.now().strftime("%Y-%m-%d %H-%M-%S")  # 파일명 안전형
+    return os.path.join(log_dir, _sanitize_windows_filename(f"{prefix} {ts}.log"))
+
+def _nonzero(b: bytes) -> bool:
+    # 전부 0x00이면 False
+    for x in b:
+        if x:
+            return True
+    return False
 
 
-def _get_dlc_bytes_fd(msg) -> int:
+# -------------------- 메인 클래스 --------------------
+class CanDataReceiverSimple:
     """
-    FD 메시지의 실제 바이트 길이를 안전하게 산출.
-    - 많은 래퍼가 DLC에 실제 길이를 넣지만, 표준 DLC코드(0..15)일 수도 있음.
-    - DATA 배열 길이가 1..63 사이면 그 값을 신뢰.
-    - 그 외에는 DLC 코드 테이블을 사용(최대 64).
-    """
-    try:
-        data_len = len(bytes(bytearray(msg.DATA)))
-    except Exception:
-        data_len = 0
-    if 0 < data_len <= 64:
-        return data_len
-    # DATA 길이로 판단이 안 될 때 DLC 사용
-    try:
-        dlc = int(msg.DLC)
-    except Exception:
-        dlc = 15  # 보수적으로 64B
-    return _FD_DLC_TABLE.get(dlc, min(max(dlc, 0), 64))
-
-
-def receive_once(mgr: PCANManager,
-                 filter_id: Optional[int] = None,
-                 timeout_s: Optional[float] = None,
-                 verbose: bool = True,
-                 quiet: bool = False) -> bool:
-    """
-    프레임 1개 수신해 출력. (프레임을 '완료'로 정의하지 않음)
-    반환: 수신 여부(True=무언가 받음 / False=타임아웃)
-    FD 전용(ReadFD만 사용).
-    """
-    deadline = None if timeout_s is None else (time.time() + float(timeout_s))
-
-    pcan = mgr._pcan
-    channel = mgr._channel
-    if pcan is None or channel is None:
-        raise RuntimeError("PCANManager가 열려 있지 않습니다. open() 먼저 호출하세요.")
-
-    while True:
-        # 타임아웃
-        if deadline is not None and time.time() > deadline:
-            if verbose and not quiet:
-                print("Timeout: no frame")
-            return False
-
-        result, msg, ts = pcan.ReadFD(channel)
-        if result == PCAN_ERROR_QRCVEMPTY:
-            time.sleep(0.001)
-            continue
-        if result != PCAN_ERROR_OK:
-            # 에러 텍스트 구해 출력
-            try:
-                _, err_txt = pcan.GetErrorText(result)
-                err_str = err_txt.decode("utf-8", errors="ignore")
-            except Exception:
-                err_str = f"0x{int(result):X}"
-            if not quiet:
-                print(f"[ERR] ReadFD failed: {err_str}")
-            # 에러여도 루프는 유지
-            time.sleep(0.005)
-            continue
-
-        # ID 필터
-        if filter_id is not None and int(msg.ID) != int(filter_id):
-            continue
-
-        # DLC 만큼만 덤프
-        dlc = _get_dlc_bytes_fd(msg)
-        raw = bytes(bytearray(msg.DATA)[:dlc])
-
-        if not quiet:
-            print(f"RX(FD): ID=0x{int(msg.ID):X} DLC={dlc}")
-        _dump_bytes("FRAME:", raw, quiet=quiet)
-        return True
-
-
-def loop_foreground(mgr,
-                    filter_id: Optional[int] = None,
-                    quiet: bool = False,
-                    stats: Optional[float] = None,
-                    duration: Optional[float] = None,
-                    yield_ms: int = 1) -> None:
-    """
-    ReadFD를 '버스트 드레인' 방식으로 계속 호출하여 연속 수신.
-    filter_id가 None이면 모든 ID 출력.
-    FD 전용(ReadFD만 사용).
-    """
-    import sys as _sys
-
-    pcan = mgr._pcan
-    ch = mgr._channel
-    if pcan is None or ch is None:
-        raise RuntimeError("PCANManager가 열려 있지 않습니다. open() 먼저 호출하세요.")
-
-    # PyCharm 콘솔에서도 줄 단위로 바로바로 보이게
-    try:
-        _sys.stdout.reconfigure(line_buffering=True)  # Python 3.7+
-    except Exception:
-        pass
-
-    print("Receiving frames... (Ctrl+C to stop)")
-    rx_count = 0
-    start_ts = last_stat_ts = time.time()
-
-    try:
-        while True:
-            any_rx = False
-
-            # === 큐가 빌 때까지 한 번에 다 뽑아 처리 ===
-            while True:
-                result, msg, ts = pcan.ReadFD(ch)
-
-                if result == PCAN_ERROR_QRCVEMPTY:
-                    break  # 이번 턴 드레인 완료
-
-                if result != PCAN_ERROR_OK:
-                    if not quiet:
-                        try:
-                            _, err_txt = pcan.GetErrorText(result)
-                            err_str = err_txt.decode("utf-8", errors="ignore")
-                        except Exception:
-                            err_str = f"0x{int(result):X}"
-                        print(f"[ERR] ReadFD failed: {err_str}")
-                    time.sleep(0.005)
-                    continue
-
-                can_id = int(msg.ID)
-                if (filter_id is None) or (can_id == int(filter_id)):
-                    dlc = _get_dlc_bytes_fd(msg)
-                    raw = bytes(bytearray(msg.DATA)[:dlc])
-                    if not quiet:
-                        print(f"RX(FD): ID=0x{can_id:X} DLC={dlc}")
-                        _dump_bytes("FRAME:", raw, quiet=quiet)
-                        _sys.stdout.flush()
-                    rx_count += 1
-                    any_rx = True
-                # 필터 불일치 프레임은 조용히 스킵
-
-            # 큐가 비어 있었으면 잠깐 쉼 (CPU 100% 방지)
-            if not any_rx:
-                time.sleep(max(0, yield_ms) / 1000.0)
-
-            # 통계/종료 관리
-            now = time.time()
-            if stats and (now - last_stat_ts) >= float(stats):
-                elapsed = now - start_ts
-                rate = rx_count / max(1e-9, elapsed)
-                print(f"[STATS] frames={rx_count} elapsed={elapsed:.2f}s rate={rate:.1f} fps")
-                last_stat_ts = now
-            if (duration is not None) and (now - start_ts >= float(duration)):
-                break
-
-    except KeyboardInterrupt:
-        print("\n[INFO] Stopped by user.")
-
-
-# =========================
-#   Continuous Receiver (BG)
-# =========================
-class ContinuousReceiver:
-    """
-    PCANBasic.ReadFD를 루프/스레드로 돌면서 연속 수신해
-    on_frame 콜백 또는 콘솔로 표시합니다.
-    FD 전용(ReadFD만 사용).
+    간단 수신기:
+      - mgr: PCANManager 인스턴스 (open() 완료 상태 권장)
+      - filter_can_id / filter_can_ids: 소프트 필터(공란/None이면 전체 수신)
+      - log_path: 지정하면 즉시 열고, None이면 자동("radar packet ...")
     """
     def __init__(self,
                  mgr: PCANManager,
-                 filter_id: Optional[int] = None,
-                 on_frame: Optional[Callable[[int, int, bytes], None]] = None,
-                 quiet: bool = False,
-                 idle_sleep_s: float = 0.001):
-        self.mgr = mgr
-        self.filter_id = filter_id
-        self.on_frame = on_frame
-        self.quiet = quiet
-        self.idle_sleep_s = idle_sleep_s
+                 filter_can_id: Optional[int] = None,
+                 filter_can_ids: Optional[Iterable[int]] = None,
+                 log_path: Optional[str] = None):
+        if PCANManager is None:
+            raise RuntimeError(f"pcan_manager import 실패: {_pcan_import_err}")
+        self._mgr = mgr
+        s: Set[int] = set()
+        if filter_can_ids:
+            s.update(int(x) for x in filter_can_ids)
+        if filter_can_id is not None:
+            s.add(int(filter_can_id))
+        self._filters: Optional[Set[int]] = s or None  # None -> 전체 허용
 
-        self._run = False
-        self._th: Optional[threading.Thread] = None
+        self._rx_thread: Optional[threading.Thread] = None
+        self._rx_stop = threading.Event()
+        self._on_packet: Optional[Callable[[bytes, int], None]] = None
 
-    def _loop_once(self) -> bool:
-        pcan = self.mgr._pcan
-        channel = self.mgr._channel
-        if pcan is None or channel is None:
-            raise RuntimeError("PCANManager가 열려 있지 않습니다. open() 먼저 호출하세요.")
+        # 로그 파일
+        if log_path is None:
+            log_path = _new_log_path("radar packet", ".")
+        self._log_path = log_path
+        try:
+            self._log_fp = open(self._log_path, "w", encoding="utf-8", newline="")
+        except Exception:
+            self._log_fp = None
 
-        result, msg, ts = pcan.ReadFD(channel)
-        if result == PCAN_ERROR_QRCVEMPTY:
-            time.sleep(self.idle_sleep_s)
-            return False
+    # ---------- 퍼블릭 API ----------
+    def close(self):
+        self.stop_rx()
+        try:
+            if self._log_fp:
+                self._log_fp.flush()
+                self._log_fp.close()
+        finally:
+            self._log_fp = None
 
-        if result != PCAN_ERROR_OK:
-            try:
-                _, err_txt = pcan.GetErrorText(result)
-                err_str = err_txt.decode("utf-8", errors="ignore")
-            except Exception:
-                err_str = f"0x{int(result):X}"
-            if not self.quiet:
-                print(f"[ERR] ReadFD failed: {err_str}")
-            time.sleep(0.005)
-            return False
-
-        can_id = int(msg.ID)
-        if self.filter_id is not None and can_id != int(self.filter_id):
-            return False
-
-        dlc = _get_dlc_bytes_fd(msg)
-        raw = bytes(bytearray(msg.DATA)[:dlc])
-
-        if self.on_frame:
-            try:
-                self.on_frame(can_id, dlc, raw)
-            except Exception as e:
-                if not self.quiet:
-                    print(f"[WARN] on_frame error: {e}")
-        else:
-            if not self.quiet:
-                print(f"RX(FD): ID=0x{can_id:X} DLC={dlc}")
-            _dump_bytes("FRAME:", raw, quiet=self.quiet)
-
-        return True
-
-    def start(self):
-        if self._run:
+    def start_rx(self, on_packet: Optional[Callable[[bytes, int], None]] = None):
+        """
+        콜백 기반 연속 수신 시작.
+        PCANManager가 자체 start_rx를 제공하면 그걸 사용하고,
+        아니면 내부 스레드 폴링로 대체.
+        """
+        if self._rx_thread and self._rx_thread.is_alive():
             return
-        self._run = True
-        self._th = threading.Thread(target=self._thread_main, name="SimpleRxFD", daemon=True)
-        self._th.start()
+        self._on_packet = on_packet
+        self._rx_stop.clear()
 
-    def _thread_main(self):
-        while self._run:
+        # 1) PCANManager가 자체 콜백을 제공하는 경우 사용
+        if hasattr(self._mgr, "start_rx") and hasattr(self._mgr, "stop_rx"):
             try:
-                self._loop_once()
-            except Exception as e:
-                if not self.quiet:
-                    print(f"[ERR] Rx loop error: {e}")
-                time.sleep(0.01)
+                def _cb(payload: bytes, can_id: int):
+                    self._handle_frame(int(can_id), bytes(payload))
+                # start_rx 시그니처 유연 처리
+                try:
+                    self._mgr.start_rx(_cb)  # type: ignore
+                    return
+                except TypeError:
+                    self._mgr.start_rx(on_frame=_cb)  # type: ignore
+                    return
+            except Exception:
+                # 실패하면 폴링으로 폴백
+                pass
 
-    def stop(self, join_timeout_s: float = 0.5):
-        self._run = False
-        th = self._th
-        self._th = None
-        if th and th.is_alive():
+        # 2) 내부 폴링 스레드
+        def _loop():
+            while not self._rx_stop.is_set():
+                try:
+                    msg = self._read_once()
+                    if msg is None:
+                        time.sleep(0.001)
+                        continue
+                    can_id, data = msg
+                    self._handle_frame(can_id, data)
+                except Exception:
+                    time.sleep(0.010)
+        self._rx_thread = threading.Thread(target=_loop, name="CanRxSimple", daemon=True)
+        self._rx_thread.start()
+
+    def stop_rx(self):
+        # PCANManager 기반이면 그것도 정지 시도
+        try:
+            if hasattr(self._mgr, "stop_rx"):
+                self._mgr.stop_rx()  # type: ignore
+        except Exception:
+            pass
+
+        self._rx_stop.set()
+        if self._rx_thread and self._rx_thread.is_alive():
             try:
-                th.join(timeout=join_timeout_s)
+                self._rx_thread.join(timeout=1.0)
+            except Exception:
+                pass
+        self._rx_thread = None
+
+    def receive_packet(self, timeout_s: float = 1.0, verbose: bool = False) -> Optional[Tuple[bytes, int]]:
+        """
+        단발 수신(폴링). 타임아웃 내 수신 없으면 None.
+        """
+        t0 = time.time()
+        while True:
+            msg = self._read_once()
+            if msg is not None:
+                can_id, data = msg
+                if self._pass_filter(can_id) and _nonzero(data):
+                    # 옵션: 콘솔 프린트
+                    if verbose:
+                        self._print_packet(can_id, data)
+                    # 파일 저장
+                    self._save_packet(can_id, data)
+                    return data, can_id
+            if (time.time() - t0) >= timeout_s:
+                return None
+            time.sleep(0.001)
+
+    # ---------- 내부 처리 ----------
+    def _pass_filter(self, can_id: int) -> bool:
+        return (self._filters is None) or (can_id in self._filters)
+
+    def _handle_frame(self, can_id: int, data: bytes):
+        # 필터/제로 프레임 처리
+        if not self._pass_filter(can_id):
+            return
+        if not _nonzero(data):
+            return
+
+        # 콘솔 출력(hexdump)
+        self._print_packet(can_id, data)
+        # 파일 저장
+        self._save_packet(can_id, data)
+        # 상위 콜백
+        if self._on_packet:
+            try:
+                self._on_packet(data, can_id)
             except Exception:
                 pass
 
+    def _print_packet(self, can_id: int, data: bytes):
+        ts = datetime.now().strftime("%H:%M:%S")
+        sys.stdout.write(f"[{ts}] CAN ID: 0x{can_id:X}\n")
+        sys.stdout.write(_hexdump_lines(data) + "\n\n")
+        sys.stdout.flush()
 
-def main(argv=None) -> int:
-    ap = argparse.ArgumentParser(description="Simple CAN-FD frame receiver (no framing), via PCANManager (FD only)")
-    ap.add_argument("--channel", default=DEFAULT_CHANNEL, help="PCAN channel (e.g., PCAN_USBBUS1)")
-    ap.add_argument("--bitrate-fd", default=DEFAULT_BITRATE_FD, help="FD bitrate string")
-    ap.add_argument("--ifg-us", type=int, default=3000, help="inter-frame gap (us) for TX; RX에는 영향 없음")
-    ap.add_argument("--filter-id", type=lambda x: int(x, 0), default=None, help="only print frames for this CAN ID")
-    ap.add_argument("--timeout", type=float, default=None, help="timeout seconds (for single receive)")
-    # ---- 모드 선택 (아무 것도 안 주면 loop가 기본) ----
-    mx = ap.add_mutually_exclusive_group()
-    mx.add_argument("--loop", action="store_true", help="foreground continuous receiving (default)")
-    mx.add_argument("--bg", action="store_true", help="background thread continuous receiving")
-    mx.add_argument("--once", action="store_true", help="receive a single frame and exit")
-    ap.add_argument("--duration", type=float, default=None, help="auto-stop after N seconds (loop/bg)")
-    ap.add_argument("--stats", type=float, default=None, help="print RX stats every N seconds")
-    ap.add_argument("--quiet", action="store_true", help="suppress frame hex dumps and logs")
-    ap.add_argument("--no-verbose", action="store_true", help="(legacy) suppress extra prints in receive_once")
-    args = ap.parse_args(argv)
+    def _save_packet(self, can_id: int, data: bytes):
+        if not self._log_fp:
+            return
+        try:
+            self._log_fp.write(f"CAN ID: 0x{can_id:X}\n")
+            self._log_fp.write(data.hex().upper() + "\n\n")  # 패킷 사이 공백 줄
+            self._log_fp.flush()
+        except Exception:
+            pass
 
-    # 기본 모드: 아무 것도 지정 안 하면 loop
-    mode = "loop"
-    if args.bg:
-        mode = "bg"
-    elif args.once:
-        mode = "once"
-    elif args.loop:
-        mode = "loop"
+    # 다양한 PCANManager 구현을 호환하기 위한 단일 read
+    def _read_once(self) -> Optional[Tuple[int, bytes]]:
+        """
+        가능한 매니저 API를 순서대로 시도해 한 번 읽기.
+        성공 시 (can_id, payload64B) 반환, 없으면 None.
+        """
+        # 1) mgr.read_once() → (msg,) or msg
+        for name in ("read_once", "read_fd", "readFD", "read", "receive"):
+            if hasattr(self._mgr, name):
+                fn = getattr(self._mgr, name)
+                try:
+                    obj = fn()
+                except TypeError:
+                    # 일부 구현은 timeout_ms나 채널을 요구할 수 있음 → 기본값 시도
+                    try:
+                        obj = fn(0)  # non-block
+                    except Exception:
+                        obj = None
+                except Exception:
+                    obj = None
 
-    mgr = PCANManager()
-    try:
-        # FD 모드로 오픈 (pcan_manager는 InitializeFD/BitrateFD 세팅을 래핑한다고 가정)
-        mgr.open(args.channel, args.bitrate_fd, ifg_us=int(args.ifg_us))
+                if obj is None:
+                    continue
+                # obj가 (msg, ts) 형태일 수 있음
+                msg = obj[0] if isinstance(obj, tuple) else obj
+                can_id, data = self._extract_from_msgfd(msg)
+                if can_id is None or data is None:
+                    continue
+                return can_id, data
 
-        if mode == "bg":
-            # 백그라운드 연속 수신
-            rx_count = 0
-            last_stat_ts = time.time()
+        # 2) 하위 필드 접근이 가능한 경우 (최후 수단) → 실패 시 None
+        return None
 
-            def _on_frame(can_id: int, dlc: int, raw: bytes):
-                nonlocal rx_count
-                rx_count += 1
-                if not args.quiet:
-                    print(f"RX(FD): ID=0x{can_id:X} DLC={dlc}")
-                    _dump_bytes("FRAME:", raw, quiet=args.quiet)
+    def _extract_from_msgfd(self, msg: Any) -> Tuple[Optional[int], Optional[bytes]]:
+        try:
+            can_id = int(msg.ID)
+        except Exception:
+            return None, None
 
-            rx = ContinuousReceiver(mgr=mgr, filter_id=args.filter_id, on_frame=_on_frame, quiet=args.quiet)
-            rx.start()
-            print("Receiving (background thread). Press Ctrl+C to stop."
-                  if args.duration is None else f"Receiving (background thread) for {args.duration:.1f}s...")
+        # 길이 계산
+        n = _length_from_msgfd(msg)
+        n = max(0, min(64, n))
+        # 데이터 추출
+        data: bytes
+        try:
+            # msg.DATA가 ctypes 배열인 경우
+            raw = msg.DATA[:n]
+            data = bytes(int(x) & 0xFF for x in raw)
+        except Exception:
             try:
-                start_ts = time.time()
-                while True:
-                    time.sleep(0.1)
-                    if args.stats:
-                        now = time.time()
-                        if now - last_stat_ts >= float(args.stats):
-                            elapsed = now - start_ts
-                            rate = rx_count / max(1e-9, elapsed)
-                            print(f"[STATS] frames={rx_count} elapsed={elapsed:.2f}s rate={rate:.1f} fps")
-                            last_stat_ts = now
-                    if args.duration is not None and (time.time() - start_ts) >= float(args.duration):
-                        break
-            except KeyboardInterrupt:
-                print("\n[INFO] Stopped by user.")
-            finally:
-                rx.stop()
+                data = bytes(msg.DATA)
+                data = data[:n]
+            except Exception:
+                return None, None
 
-        elif mode == "loop":
-            # ✅ 기본: 포그라운드 연속 수신 (FD 버스트 드레인)
-            loop_foreground(
-                mgr,
-                filter_id=args.filter_id,
-                quiet=args.quiet,
-                stats=args.stats,
-                duration=args.duration,
-                yield_ms=1
-            )
+        # 수신 규칙: 고정 64B로 운용한다면, 길이가 짧아도 64로 맞출 수 있음
+        # 여기서는 실제 길이 n만 사용(저장/표시 모두 n바이트)
+        return can_id, data
 
-        else:  # once
-            _ = receive_once(
-                mgr,
-                filter_id=args.filter_id,
-                timeout_s=args.timeout,
-                verbose=(not args.no_verbose),
-                quiet=args.quiet,
-            )
 
+# -------------------- 실행 진입점 --------------------
+def main():
+    """
+    간단 실행:
+        python can_data_receiver_simple.py
+    환경변수:
+        PCAN_CHANNEL   (기본: PCAN_USBBUS1)
+        PCAN_BITRATEFD (기본: 레포 예제값)
+        PCAN_IFG_US    (기본: 3000)
+        PCAN_FILTER    (예: "0xD1,0xD2 0x100-0x10F" → 다중/범위)
+    """
+    if PCANManager is None:
+        print(f"[ERR] pcan_manager import 실패: {_pcan_import_err}", file=sys.stderr)
+        sys.exit(1)
+
+    channel = os.environ.get("PCAN_CHANNEL", "PCAN_USBBUS1")
+    bitrate_fd = os.environ.get(
+        "PCAN_BITRATEFD",
+        "f_clock=80000000,nom_brp=2,nom_tseg1=33,nom_tseg2=6,nom_sjw=1,"
+        "data_brp=2,data_tseg1=6,data_tseg2=1,data_sjw=1,data_ssp_offset=14"
+    )
+    ifg_us = int(os.environ.get("PCAN_IFG_US", "3000"))
+
+    # 필터 파싱
+    filt_env = os.environ.get("PCAN_FILTER", "").strip()
+    filter_ids: Optional[Set[int]] = None
+    if filt_env:
+        ids: Set[int] = set()
+        for tok in re.split(r"[,\s]+", filt_env):
+            if not tok:
+                continue
+            if "-" in tok:
+                a, b = tok.split("-", 1)
+                try:
+                    lo = int(a, 0); hi = int(b, 0)
+                    if lo > hi:
+                        lo, hi = hi, lo
+                    ids.update(range(lo, hi + 1))
+                except Exception:
+                    pass
+            else:
+                try:
+                    ids.add(int(tok, 0))
+                except Exception:
+                    pass
+        filter_ids = ids or None
+
+    # 매니저 오픈
+    mgr = PCANManager()
+    mgr.open(channel, bitrate_fd, ifg_us=ifg_us)
+
+    # 수신기 생성
+    rx = CanDataReceiverSimple(mgr, filter_can_ids=filter_ids)
+
+    print("Receiving frames continuously... (Ctrl+C to stop)")
+
+    try:
+        # 콜백 기반 (가능하면)
+        def _on_packet(data: bytes, can_id: int):
+            # 실제 처리(프린트/저장)는 클래스 내부에서 이미 수행됨.
+            # 여기선 추가 가공이 필요하면 작성.
+            pass
+
+        try:
+            rx.start_rx(on_packet=_on_packet)
+            # 메인 스레드 idle 대기
+            while True:
+                time.sleep(0.2)
+        except Exception:
+            # 콜백이 불가하면 폴링
+            while True:
+                rx.receive_packet(timeout_s=0.5, verbose=True)
+
+    except KeyboardInterrupt:
+        print("Stopped by user.")
     finally:
-        mgr.close()
-    return 0
+        try:
+            rx.stop_rx()
+        except Exception:
+            pass
+        try:
+            rx.close()
+        except Exception:
+            pass
+        try:
+            if hasattr(mgr, "close"):
+                mgr.close()
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()

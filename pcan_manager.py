@@ -14,7 +14,7 @@ from __future__ import annotations
 from typing import Optional
 import time
 from ctypes import c_ubyte
-from PCANBasic import *  # noqa
+from PCANBasic import *
 import threading
 from queue import Queue, Empty
 
@@ -184,27 +184,49 @@ class PCANManager:
         on_frame(payload_bytes: bytes, can_id: int) 콜백을 호출합니다.
         (payload는 64B 원본; 필요 시 GUI에서 ASCII 디코딩/trim)
         """
-        if self._rx_thread and self._rx_thread.is_alive():
+        # 이미 동작 중이면 그대로 둠
+        if getattr(self, "_rx_thread", None) and self._rx_thread.is_alive():
             return
+
         self._on_frame = on_frame
         self._rx_stop.clear()
 
         def _loop():
             while not self._rx_stop.is_set():
                 try:
-                    msg = self._read_once()
+                    msg = self._read_once()  # None 또는 TPCANMsgFD
                     if msg is None:
                         time.sleep(PCAN_READ_TIMEOUT_MS / 1000.0)
                         continue
-                    payload = self._payload_from_msgfd(msg)
-                    self._rx_q.put(payload)
+
+                    payload = self._payload_from_msgfd(msg)  # bytes (최대 64B)
+                    can_id  = int(getattr(msg, "ID", 0))
+
+                    # 내부 큐에도 넣어두고
+                    self._rx_q.put((payload, can_id))
+
+                    # 콜백 있으면 호출
                     if self._on_frame:
                         try:
-                            self._on_frame(payload, int(msg.ID))
+                            self._on_frame(payload, can_id)
                         except Exception:
+                            # 콜백 오류는 수신 루프까지 죽이지 않음
                             pass
                 except Exception:
-                    # 안정성 위해 과한 예외 전파는 억제하고 잠깐 쉼
+                    # 안정성: 과한 예외 전파 억제
                     time.sleep(0.01)
 
-        self._rx_thread = threading.Thread
+        # import threading
+        self._rx_thread = threading.Thread(target=_loop, name="pcan-rx", daemon=True)
+        self._rx_thread.start()
+
+
+    def stop_rx(self):
+        """수신 스레드 정지 및 정리"""
+        if getattr(self, "_rx_thread", None):
+            self._rx_stop.set()
+            try:
+                self._rx_thread.join(timeout=1.0)
+            except Exception:
+                pass
+            self._rx_thread = None
