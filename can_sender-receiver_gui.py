@@ -2,19 +2,22 @@
 # -*- coding: utf-8 -*-
 
 """
-can_data_process_gui.py
-- PyQt6 GUI for CAN CLI
-- TX: can_cli_command_sender.CanCliCommandSender (backend)
-- RX: can_data_receiver.CanDataReceiver (프레이밍 조립 후 완성 메시지 수신)
+can_sender-receiver_gui.py (stable)
 
-필요 패키지:
-    pip install PyQt6
+- PyQt6 GUI for CAN CLI
+- TX: can_cli_command_sender.CanCliCommandSender
+- RX: can_data_receiver.CanDataReceiver (조립 완료 '완성 패킷' 수신)
+- 모든 수신 패킷을 "radar packet YYYY-MM-DD HH-mm-ss.log" 로 안전 저장
+- UI 업데이트는 반드시 메인 스레드에서만 수행 (스레드-세이프)
+
+pip install PyQt6
 """
 
 from __future__ import annotations
-from typing import List, Optional
+from typing import List, Optional, Set
+import sys, os, re, binascii, queue
+from datetime import datetime
 
-import sys, os, binascii
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QObject, QEvent
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QFileDialog, QMessageBox,
@@ -45,7 +48,27 @@ except Exception:
     PCANManager = None  # type: ignore
 
 
-# -------- 송신 작업 스레드 --------
+# ================= 유틸: 필터 파서 =================
+def _parse_filter_ids(text: str) -> Optional[Set[int]]:
+    s = (text or "").strip()
+    if not s:
+        return None
+    out: Set[int] = set()
+    for tok in re.split(r"[,\s]+", s):
+        if not tok:
+            continue
+        if "-" in tok:
+            a, b = tok.split("-", 1)
+            lo = int(a, 0); hi = int(b, 0)
+            if lo > hi:
+                lo, hi = hi, lo
+            out.update(range(lo, hi + 1))
+        else:
+            out.add(int(tok, 0))
+    return out or None
+
+
+# ================= 송신 작업 스레드 =================
 class SendWorker(QThread):
     progress = pyqtSignal(int)
     lineSent = pyqtSignal(str)
@@ -86,10 +109,66 @@ class SendWorker(QThread):
         self._stop = True
 
 
-# -------- 수신 작업 스레드 (CanDataReceiver 사용) --------
-class ReceiveWorker(QThread):
-    rxText = pyqtSignal(str, int)      # 완성 텍스트, CAN ID (-1은 미상)
-    rxBinary = pyqtSignal(bytes, int)  # 완성 바이너리, CAN ID
+# ================= 파일 저장 전용 워커 =================
+class PacketLoggerWorker(QThread):
+    error = pyqtSignal(str)
+    droppedWarn = pyqtSignal(int)  # 누적 드롭 수 알림
+
+    def __init__(self, path: str, flush_every: int = 20):
+        super().__init__()
+        self._path = path
+        self._q: "queue.Queue[tuple[int, bytes]]" = queue.Queue(maxsize=4096)
+        self._stop = False
+        self._file = None
+        self._flush_every = max(1, flush_every)
+        self._write_count = 0
+        self._dropped = 0
+
+    def enqueue(self, can_id: int, data: bytes):
+        try:
+            self._q.put_nowait((can_id, data))
+        except queue.Full:
+            self._dropped += 1
+            if self._dropped % 100 == 1:
+                self.droppedWarn.emit(self._dropped)
+
+    def run(self):
+        try:
+            self._file = open(self._path, "a", encoding="ascii", buffering=1)
+        except Exception as e:
+            self.error.emit(f"로그 파일 오픈 실패: {e}")
+            return
+        try:
+            while not self._stop:
+                try:
+                    can_id, data = self._q.get(timeout=0.2)
+                except queue.Empty:
+                    continue
+                try:
+                    hexstr = binascii.hexlify(data).decode("ascii").upper()
+                    self._file.write(f"CAN ID: 0x{can_id:X}\n")
+                    self._file.write(hexstr + "\n\n")  # 패킷 구분용 빈 줄
+                    self._write_count += 1
+                    if (self._write_count % self._flush_every) == 0:
+                        self._file.flush()
+                except Exception as e:
+                    self.error.emit(f"로그 파일 쓰기 실패: {e}")
+        finally:
+            try:
+                if self._file:
+                    self._file.flush()
+                    self._file.close()
+            except Exception:
+                pass
+
+    def stop(self):
+        self._stop = True
+
+
+# ================= 폴링 수신 워커 (콜백 실패 시 폴백) =================
+class PollWorker(QThread):
+    rxText = pyqtSignal(str, int)
+    rxBinary = pyqtSignal(bytes, int)
     error = pyqtSignal(str)
 
     def __init__(self, receiver: "CanDataReceiver", timeout_s: float, verbose: bool):
@@ -99,136 +178,38 @@ class ReceiveWorker(QThread):
         self.verbose = verbose
         self._stop = False
 
-        # 콜백 기반 연속 수신 지원 여부 감지
-        self._has_callback = all(
-            hasattr(self.receiver, name) for name in ("start_rx", "stop_rx")
-        )
-
-    # ---- 다양한 시그니처 호환: 한 번 수신 시도 ----
-    def _recv_once(self):
-        """
-        가능한 메서드를 순서대로 시도해 한 번 수신.
-        성공 시 bytes 또는 (bytes, can_id) 반환, 미수신/타임아웃 시 None.
-        """
-        # 1) receive_packet(timeout_s=..., verbose=...)
-        if hasattr(self.receiver, "receive_packet"):
-            try:
-                return self.receiver.receive_packet(timeout_s=self.timeout_s, verbose=self.verbose)
-            except TypeError:
-                # verbose 미지원
-                try:
-                    return self.receiver.receive_packet(timeout_s=self.timeout_s)
-                except TypeError:
-                    # 키워드 미지원 → 위치 인자
-                    try:
-                        return self.receiver.receive_packet(self.timeout_s)
-                    except Exception:
-                        pass
-            except Exception:
-                pass
-
-        # 2) receiveData(...) 폴백
-        if hasattr(self.receiver, "receiveData"):
-            try:
-                return self.receiver.receiveData(timeout_s=self.timeout_s)
-            except TypeError:
-                try:
-                    return self.receiver.receiveData(self.timeout_s)
-                except Exception:
-                    pass
-            except Exception:
-                pass
-
-        # 수신 API 없음
-        raise RuntimeError("Receiver has no compatible receive method (receive_packet/receiveData)")
-
-    # ---- 콜백 핸들러(콜백 기반 연속 수신 모드에서 사용) ----
-    def _on_callback_packet(self, pkt):
-        """
-        pkt: bytes 또는 (bytes, can_id) 가정.
-        텍스트/바이너리 자동 분기 후 UI로 신호 전파.
-        """
-        data, can_id = (pkt, -1) if not isinstance(pkt, tuple) else (pkt[0], pkt[1])
-        try:
-            text = data.decode("utf-8")
-            self.rxText.emit(text, can_id if isinstance(can_id, int) else -1)
-        except UnicodeDecodeError:
-            self.rxBinary.emit(data, can_id if isinstance(can_id, int) else -1)
-
     def run(self):
         try:
-            if self._has_callback:
-                # ----- 이벤트 드리븐 연속 수신 -----
-                try:
-                    # start_rx가 (callback) 또는 (on_packet=callback) 둘 다 수용하도록 시도
-                    try:
-                        self.receiver.start_rx(self._on_callback_packet)
-                    except TypeError:
-                        self.receiver.start_rx(on_packet=self._on_callback_packet)  # type: ignore
-                except Exception as e:
-                    # 콜백 모드 실패 시 폴링으로 폴백
-                    self._has_callback = False
-                    self.error.emit(f"start_rx fallback to polling: {e}")
-
-            if self._has_callback:
-                # 콜백 모드에서 스레드는 종료 신호만 감시
-                while not self._stop:
-                    self.msleep(50)
-                # 정리
-                try:
-                    self.receiver.stop_rx()
-                except Exception:
-                    pass
-                try:
-                    self.receiver.close()
-                except Exception:
-                    pass
-                return
-
-            # ----- 폴링 연속 수신 -----
             while not self._stop:
-                pkt = self._recv_once()
+                pkt = self.receiver.receive_packet(timeout_s=self.timeout_s, verbose=self.verbose)
                 if pkt is None:
-                    # 타임아웃/미수신 → 과도한 CPU 점유 방지
                     self.msleep(2)
                     continue
-
-                # bytes 또는 (bytes, can_id) 모두 처리
-                if isinstance(pkt, tuple):
-                    data, can_id = pkt[0], pkt[1] if len(pkt) > 1 else -1
-                else:
-                    data, can_id = pkt, -1
-
+                data, can_id = pkt
                 try:
                     text = data.decode("utf-8")
-                    self.rxText.emit(text, can_id if isinstance(can_id, int) else -1)
+                    self.rxText.emit(text, can_id)
                 except UnicodeDecodeError:
-                    self.rxBinary.emit(data, can_id if isinstance(can_id, int) else -1)
-
+                    self.rxBinary.emit(data, can_id)
         except Exception as e:
             self.error.emit(str(e))
 
     def stop(self):
         self._stop = True
-        # 폴링 모드에서 blocking 되어 있더라도, 다음 루프에서 종료
-        # 콜백 모드에선 run() 말미에서 stop_rx/close 호출
-        try:
-            if hasattr(self.receiver, "wake") and callable(self.receiver.wake):
-                # 드물게 블로킹 해제를 위한 wake()가 있을 수 있음
-                self.receiver.wake()
-        except Exception:
-            pass
 
 
-# -------- REPL 수신 신호 브리지 (백엔드 start_repl 사용 시 대비) --------
-class ReplBridge(QObject):
-    rxText = pyqtSignal(str, int)  # text, can_id
+# ================= UI 브리지(메인 스레드에서만 UI 갱신) =================
+class UiBridge(QObject):
+    rx_bin = pyqtSignal(int, object)   # (can_id, bytes)
+    rx_txt = pyqtSignal(int, str)      # (can_id, text)
+    log_msg = pyqtSignal(str)
 
 
+# ================= 메인 윈도우 =================
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("CAN Data Process GUI (PyQt6)")
+        self.setWindowTitle("CAN Sender/Receiver (Framed) - PyQt6")
         self.resize(1280, 860)
 
         if CanCliCommandSender is None:
@@ -237,13 +218,19 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "오류", f"수신기(can_data_receiver) import 실패: {_rx_err}")
 
         self.txWorker: Optional[SendWorker] = None
-        self.rxWorker: Optional[ReceiveWorker] = None
+        self.pollWorker: Optional[PollWorker] = None
+        self.loggerWorker: Optional[PacketLoggerWorker] = None
         self.sender: Optional["CanCliCommandSender"] = None
         self._rx_receiver: Optional[CanDataReceiver] = None
 
-        # 우리가 별도로 연 PCANManager인지(연결 해제 시 닫기 위함)
         self._rx_mgr_owned = False
         self._rx_mgr = None
+
+        # ---- UI 브리지(메인스레드 시그널로만 UI수정) ----
+        self.uiBus = UiBridge()
+        self.uiBus.rx_bin.connect(self._on_ui_rx_bin)
+        self.uiBus.rx_txt.connect(self._on_ui_rx_txt)
+        self.uiBus.log_msg.connect(self._append_log)
 
         # ---------------- 상단: 연결/수신 설정 ----------------
         self.edChannel = QLineEdit("PCAN_USBBUS1")
@@ -252,7 +239,8 @@ class MainWindow(QMainWindow):
             "data_brp=2,data_tseg1=6,data_tseg2=1,data_sjw=1,data_ssp_offset=14"
         )
         self.edIfg = QSpinBox(); self.edIfg.setRange(0, 20000); self.edIfg.setValue(3000)
-        self.edFilterId = QLineEdit("0xC0")  # 빈칸이면 전체 수신
+        self.edFilterIds = QLineEdit("")  # 빈칸=전체
+        self.edFilterIds.setPlaceholderText("예: 0xD1, 0x200-0x20F  (빈칸=전체)")
         self.edTimeout = QSpinBox(); self.edTimeout.setRange(1, 120); self.edTimeout.setValue(30)
         self.chkVerbose = QCheckBox("RX verbose"); self.chkVerbose.setChecked(False)
 
@@ -266,7 +254,7 @@ class MainWindow(QMainWindow):
         row.addSpacing(10)
         row.addWidget(QLabel("IFG us")); row.addWidget(self.edIfg)
         row.addSpacing(10)
-        row.addWidget(QLabel("Filter ID")); row.addWidget(self.edFilterId)
+        row.addWidget(QLabel("Filter IDs")); row.addWidget(self.edFilterIds)
         row.addSpacing(10)
         row.addWidget(QLabel("Timeout s")); row.addWidget(self.edTimeout)
         row.addWidget(self.chkVerbose)
@@ -276,10 +264,10 @@ class MainWindow(QMainWindow):
         gbConn = QGroupBox("Connection (TX: CanCliCommandSender, RX: CanDataReceiver)")
         layConn = QVBoxLayout(); layConn.addLayout(row); gbConn.setLayout(layConn)
 
-        # ---------------- 중앙: 좌(리스트) / 우(에디터) ----------------
+        # ---------------- 중앙: 좌/우 ----------------
         self.listLines = QListWidget()
         self.textEditor = QTextEdit()
-        self.textEditor.setPlaceholderText("여기에 명령을 입력하거나, 파일을 열어 미리보세요. (%, 공백은 스킵 옵션 적용)")
+        self.textEditor.setPlaceholderText("명령을 입력하거나 파일을 로드하세요. (%, 공백 스킵옵션 적용)")
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
         splitter.addWidget(self.listLines)
@@ -306,22 +294,20 @@ class MainWindow(QMainWindow):
         optRow.addWidget(self.btnStop)
         optRow.addWidget(self.btnClear)
 
-        # ---------------- 진행/로그 ----------------
+        # ---------------- 진행/로그/콘솔 ----------------
         self.progress = QProgressBar(); self.progress.setRange(0, 100)
         self.log = QTextEdit(); self.log.setReadOnly(True)
-
-        # ---------------- REPL 콘솔 ----------------
         self.console = QTextEdit(); self.console.setReadOnly(True)
-        self.console.setPlaceholderText("REPL 콘솔 출력 (수신 메시지: 조립 완료 텍스트/바이너리)")
+        self.console.setPlaceholderText("완성 패킷 요약(hex) 표시")
         self.consoleInput = QLineEdit()
-        self.consoleInput.setPlaceholderText("REPL 명령 입력 후 Enter.  ↑/↓: 히스토리,  Ctrl+L: 콘솔 클리어")
+        self.consoleInput.setPlaceholderText("단일 명령 입력. ↑/↓=히스토리, Ctrl+L=클리어")
         self.hist: List[str] = []; self.hidx: int = 0
 
-        # 백엔드 REPL 대비 브리지(지금은 CanDataReceiver 사용)
-        self.replBridge = ReplBridge()
-        self.replBridge.rxText.connect(self._on_repl_rx_text)
+        # 메모리/성능 보호: 최대 라인 제한
+        self.console.document().setMaximumBlockCount(5000)
+        self.log.document().setMaximumBlockCount(2000)
 
-        # ---------------- 레이아웃 구성 ----------------
+        # ---------------- 레이아웃 ----------------
         central = QWidget(); root = QVBoxLayout(central)
         root.addWidget(gbConn)
         root.addWidget(splitter, 1)
@@ -332,7 +318,7 @@ class MainWindow(QMainWindow):
         root.addWidget(self.consoleInput)
         self.setCentralWidget(central)
 
-        # ---------------- 시그널 연결 ----------------
+        # ---------------- 시그널 ----------------
         self.btnOpen.clicked.connect(self.on_open)
         self.btnSendAll.clicked.connect(self.on_send_all)
         self.btnSendSelected.clicked.connect(self.on_send_selected)
@@ -344,7 +330,7 @@ class MainWindow(QMainWindow):
         self.consoleInput.returnPressed.connect(self.on_repl_enter)
         self.consoleInput.installEventFilter(self)
 
-    # ================= 유틸 =================
+    # ---------- 유틸 ----------
     def _filter_lines(self, lines: List[str]) -> List[str]:
         out = []
         for s in lines:
@@ -362,7 +348,7 @@ class MainWindow(QMainWindow):
     def _err(self, msg: str):
         QMessageBox.critical(self, "오류", msg)
 
-    # ================= 파일 열기 =================
+    # ---------- 파일 열기 ----------
     def on_open(self):
         path, _ = QFileDialog.getOpenFileName(
             self, "명령 파일 선택", "", "Text files (*.txt *.cfg *.cmd *.conf);;All files (*.*)"
@@ -375,36 +361,24 @@ class MainWindow(QMainWindow):
         except UnicodeDecodeError:
             with open(path, "r", encoding="cp949", errors="ignore") as f:
                 content = f.read()
-
         self.textEditor.setPlainText(content)
         self.listLines.clear()
         for line in self._filter_lines(content.splitlines()):
             self.listLines.addItem(QListWidgetItem(line))
         self._append_log(f"[INFO] 파일 로드: {path}")
 
-    # ================= Connect/Disconnect =================
-    def _parse_filter_id(self) -> Optional[int]:
-        s = self.edFilterId.text().strip()
-        if not s:
-            return None
-        try:
-            return int(s, 0)
-        except Exception:
-            self._append_log(f"[WARN] Filter ID 파싱 실패: {s} (전체 수신)")
-            return None
-
+    # ---------- Connect / Disconnect ----------
     def on_connect(self):
         if CanCliCommandSender is None or CanDataReceiver is None:
             self._err("백엔드/수신기 import 실패")
             return
 
-        # 중복 연결 방지
-        if self.sender is not None or self._rx_receiver is not None or (self.rxWorker is not None):
+        if self.sender is not None or self._rx_receiver is not None or (self.pollWorker is not None):
             self._append_log("[WARN] 이미 연결되어 있습니다. 먼저 Disconnect 하세요.")
             return
 
         try:
-            # 1) TX: Sender 인스턴스 생성 및 연결
+            # TX
             self.sender = CanCliCommandSender(
                 channel=self.edChannel.text().strip(),
                 bitrate_fd=self.edBitrate.text().strip(),
@@ -412,13 +386,12 @@ class MainWindow(QMainWindow):
             self.sender.connect(ifg_us=int(self.edIfg.value()))
             self._append_log("[INFO] TX 연결 완료")
 
-            # 2) RX: TX의 PCANManager 재사용 시도 (불가하면 별도 생성)
+            # RX 매니저
             rx_mgr = None
             try:
                 rx_mgr = self.sender._require_mgr()  # type: ignore[attr-defined]
             except Exception:
                 rx_mgr = None
-
             if rx_mgr is None:
                 if PCANManager is None:
                     self._err("PCANManager 로드 실패: RX 매니저 생성 불가")
@@ -436,24 +409,38 @@ class MainWindow(QMainWindow):
                 self._append_log("[INFO] 별도 RX 매니저 오픈")
             else:
                 self._rx_mgr_owned = False
-
             self._rx_mgr = rx_mgr
 
-            # 3) 수신기 생성
-            self._rx_receiver = CanDataReceiver(rx_mgr, filter_can_id=self._parse_filter_id())
+            # 로그 파일 준비
+            ts = datetime.now().strftime("%Y-%m-%d %H-%M-%S")  # Windows ':' 금지 → '-' 사용
+            log_name = f"radar packet {ts}.log"
+            log_path = os.path.abspath(log_name)
+            self.loggerWorker = PacketLoggerWorker(log_path, flush_every=20)
+            self.loggerWorker.error.connect(lambda m: self._append_log(f"[LOG-ERR] {m}"))
+            self.loggerWorker.droppedWarn.connect(
+                lambda n: self._append_log(f"[LOG-WARN] 저장 큐 포화로 {n}개 드롭됨 (수신은 계속 진행)")
+            )
+            self.loggerWorker.start()
+            self._append_log(f"[INFO] 저장 파일: {log_path}")
 
-            # 4) 수신 콜백
+            # 수신기
+            filter_ids = _parse_filter_ids(self.edFilterIds.text())
+            self._rx_receiver = CanDataReceiver(rx_mgr, filter_can_ids=filter_ids)
+
+            # 콜백(백그라운드 스레드) → 메인 스레드 신호만 발생
             def _on_complete_packet(data: bytes, can_id: int):
                 try:
-                    txt = data.decode("utf-8")
-                    self.console.append(f"[RX 0x{can_id:X}] {txt}")
-                except UnicodeDecodeError:
-                    s = binascii.hexlify(data).decode("ascii")
-                    if len(s) > 256:
-                        s = s[:256] + "..."
-                    self.console.append(f"[RX 0x{can_id:X}] {len(data)}B: {s}")
+                    if self.loggerWorker is not None:
+                        self.loggerWorker.enqueue(int(can_id), bytes(data))
+                except Exception:
+                    pass
+                # UI는 직접 만지지 않고, 신호로 전달
+                try:
+                    self.uiBus.rx_bin.emit(int(can_id), bytes(data))
+                except Exception:
+                    pass
 
-            # 5) 콜백 기반 → 실패 시 폴링
+            # 콜백 기반 연속 수신 시도
             started_callback = False
             try:
                 self._rx_receiver.start_rx(on_packet=_on_complete_packet)
@@ -462,95 +449,130 @@ class MainWindow(QMainWindow):
             except Exception as e:
                 self._append_log(f"[WARN] start_rx 실패 → 폴링으로 폴백: {e}")
 
+            # 폴링 폴백 경로: PollWorker 시그널 → 메인스레드 슬롯
             if not started_callback:
-                try:
-                    self._rx_receiver.start_polling(poll_interval_s=0.001)
-                    self._append_log("[INFO] RX: 폴링 기반 연속 수신 시작(start_polling)")
-                except Exception as e:
-                    self._err(f"RX 시작 실패: {e}")
-                    try:
-                        self.sender.disconnect()
-                    except Exception:
-                        pass
-                    self.sender = None
-                    try:
-                        if self._rx_mgr_owned and self._rx_mgr is not None and hasattr(self._rx_mgr, 'close'):
-                            self._rx_mgr.close()  # type: ignore[attr-defined]
-                    except Exception:
-                        pass
-                    self._rx_mgr_owned = False
-                    self._rx_mgr = None
-                    self._rx_receiver = None
-                    return
-
-                self.rxWorker = ReceiveWorker(
+                self.pollWorker = PollWorker(
                     receiver=self._rx_receiver,
                     timeout_s=float(self.edTimeout.value()),
                     verbose=self.chkVerbose.isChecked()
                 )
-                self.rxWorker.rxText.connect(lambda text, _id: self.console.append(f"[RX] {text}"))
-                self.rxWorker.rxBinary.connect(lambda data, _id: (
-                    self.console.append(f"[RX-BIN] {len(data)} bytes: "
-                                        f"{(binascii.hexlify(data).decode('ascii')[:256] + '...') if len(data) > 128 else binascii.hexlify(data).decode('ascii')}")))
-                self.rxWorker.error.connect(lambda msg: self.console.append(f"[RX-ERR] {msg}"))
-                self.rxWorker.start()
+                self.pollWorker.rxBinary.connect(self._on_worker_rx_bin)
+                self.pollWorker.rxText.connect(self._on_worker_rx_text)
+                self.pollWorker.error.connect(lambda msg: self.console.append(f"[RX-ERR] {msg}"))
+                self.pollWorker.start()
+                self._append_log("[INFO] RX: 폴링 기반 연속 수신 시작")
 
-            # 6) UI 상태
+            # UI 상태
             self.btnConnect.setEnabled(False)
             self.btnDisconnect.setEnabled(True)
             self.statusBar().showMessage("Connected")
             self._append_log("[INFO] 전체 연결 및 수신 시작 완료")
 
         except Exception as e:
-            try:
-                if self.rxWorker is not None:
-                    self.rxWorker.stop()
-                    self.rxWorker.wait(500)
-                    self.rxWorker = None
-            except Exception:
-                pass
-            try:
-                if self._rx_receiver is not None:
-                    self._rx_receiver.stop_rx()
-                    self._rx_receiver.stop_polling()
-                    self._rx_receiver.close()
-                    self._rx_receiver = None
-            except Exception:
-                pass
-            if self._rx_mgr_owned and self._rx_mgr is not None:
-                try:
-                    if hasattr(self._rx_mgr, "close"):
-                        self._rx_mgr.close()  # type: ignore[attr-defined]
-                except Exception:
-                    pass
-                self._rx_mgr_owned = False
-                self._rx_mgr = None
-            try:
-                if self.sender is not None:
-                    self.sender.disconnect()
-            except Exception:
-                pass
-            self.sender = None
+            self._teardown_on_error()
             self._err(str(e))
 
-    def _on_rx_binary(self, data: bytes, _id: int):
-        s = binascii.hexlify(data).decode("ascii")
-        if len(s) > 128:
-            s = s[:128] + "..."
-        self.console.append(f"[RX-BIN] {len(data)} bytes: {s}")
+    # PollWorker → 메인스레드 슬롯
+    def _on_worker_rx_bin(self, data: bytes, can_id: int):
+        try:
+            if self.loggerWorker is not None:
+                self.loggerWorker.enqueue(int(can_id), bytes(data))
+        except Exception:
+            pass
+        self.uiBus.rx_bin.emit(int(can_id), bytes(data))
+
+    def _on_worker_rx_text(self, text: str, can_id: int):
+        b = text.encode("utf-8", "replace")
+        try:
+            if self.loggerWorker is not None:
+                self.loggerWorker.enqueue(int(can_id), b)
+        except Exception:
+            pass
+        self.uiBus.rx_txt.emit(int(can_id), text)
+
+    def _append_console_hex(self, can_id: int, data: bytes):
+        try:
+            hexstr = binascii.hexlify(data).decode("ascii").upper()
+            if len(hexstr) > 256:
+                hexstr = hexstr[:256] + "..."
+            self.console.append(f"CAN ID: 0x{can_id:X}\n{hexstr}\n")
+        except Exception:
+            pass
+
+    # 메인스레드 UI 브리지 슬롯
+    def _on_ui_rx_bin(self, can_id: int, data_obj: object):
+        try:
+            data = bytes(data_obj) if not isinstance(data_obj, (bytes, bytearray)) else bytes(data_obj)
+        except Exception:
+            return
+        self._append_console_hex(can_id, data)
+
+    def _on_ui_rx_txt(self, can_id: int, text: str):
+        self.console.append(f"CAN ID: 0x{can_id:X}\n{text}\n")
+
+    def _teardown_on_error(self):
+        try:
+            if self.pollWorker is not None:
+                self.pollWorker.stop()
+                self.pollWorker.wait(500)
+                self.pollWorker = None
+        except Exception:
+            pass
+        try:
+            if self._rx_receiver is not None:
+                try:
+                    self._rx_receiver.stop_rx()
+                except Exception:
+                    pass
+                try:
+                    self._rx_receiver.close()
+                except Exception:
+                    pass
+                self._rx_receiver = None
+        except Exception:
+            pass
+        try:
+            if self.loggerWorker is not None:
+                self.loggerWorker.stop()
+                self.loggerWorker.wait(1000)
+                self.loggerWorker = None
+        except Exception:
+            pass
+        if self._rx_mgr_owned and self._rx_mgr is not None:
+            try:
+                if hasattr(self._rx_mgr, "close"):
+                    self._rx_mgr.close()  # type: ignore[attr-defined]
+            except Exception:
+                pass
+            self._rx_mgr_owned = False
+            self._rx_mgr = None
+        try:
+            if self.sender is not None:
+                self.sender.disconnect()
+        except Exception:
+            pass
+        self.sender = None
 
     def on_disconnect(self):
         try:
-            if self.rxWorker is not None:
-                self.rxWorker.stop()
-                self.rxWorker.wait(1000)
-                self.rxWorker = None
+            if self.pollWorker is not None:
+                self.pollWorker.stop()
+                self.pollWorker.wait(1000)
+                self.pollWorker = None
             if self._rx_receiver is not None:
                 try:
                     self._rx_receiver.close()
                 except Exception:
                     pass
                 self._rx_receiver = None
+        except Exception:
+            pass
+
+        try:
+            if self.loggerWorker is not None:
+                self.loggerWorker.stop()
+                self.loggerWorker.wait(1500)
+                self.loggerWorker = None
         except Exception:
             pass
 
@@ -579,6 +601,7 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("Disconnected")
         self._append_log("[INFO] 연결 해제")
 
+    # ---------- 전송 ----------
     def _start_send(self, lines: List[str]):
         if self.sender is None:
             self._err("연결되어 있지 않습니다. 먼저 Connect 하세요.")
@@ -608,6 +631,7 @@ class MainWindow(QMainWindow):
 
     def _reset_buttons(self):
         self.btnSendAll.setEnabled(True)
+        the_same = True
         self.btnSendSelected.setEnabled(True)
         self.btnStop.setEnabled(False)
         self.progress.setValue(100)
@@ -631,9 +655,7 @@ class MainWindow(QMainWindow):
             self.txWorker.stop()
             self._append_log("[INFO] 중지 요청됨")
 
-    def _on_repl_rx_text(self, text: str, can_id: int):
-        self.console.append(f"[{hex(can_id)}] {text}")
-
+    # ---------- REPL ----------
     def on_repl_enter(self):
         if self.sender is None:
             self.console.append("[ERR] 연결되어 있지 않습니다.")
@@ -650,6 +672,7 @@ class MainWindow(QMainWindow):
         finally:
             self.consoleInput.clear()
 
+    # ↑/↓ 히스토리, Ctrl+L 클리어
     def eventFilter(self, obj, ev):
         if obj is self.consoleInput and ev.type() == QEvent.Type.KeyPress:
             key = ev.key(); mod = ev.modifiers()
@@ -658,18 +681,16 @@ class MainWindow(QMainWindow):
             if key == Qt.Key.Key_Up:
                 if self.hist:
                     self.hidx = max(0, self.hidx - 1)
-                    self.consoleInput.setText(self.hist[self.hidx])
-                return True
+                    self.consoleInput.setText(self.hist[self.hidx]); return True
             if key == Qt.Key.Key_Down:
                 if self.hist:
                     self.hidx = min(len(self.hist), self.hidx + 1)
-                    if self.hidx == len(self.hist):
-                        self.consoleInput.clear()
-                    else:
-                        self.consoleInput.setText(self.hist[self.hidx])
-                return True
+                    if self.hidx == len(self.hist): self.consoleInput.clear()
+                    else: self.consoleInput.setText(self.hist[self.hidx])
+                    return True
         return super().eventFilter(obj, ev)
 
+    # 창 닫을 때 안전 정리
     def closeEvent(self, ev):
         try:
             self.on_disconnect()
