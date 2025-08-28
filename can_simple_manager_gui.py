@@ -2,12 +2,12 @@
 # -*- coding: utf-8 -*-
 
 """
-can_sender-receiver_simple_gui.py
+can_simple_manager_gui.py
 
 - PyQt6 GUI
-- TX: can_cli_command_sender.CanCliCommandSender
-- RX: can_data_receiver_simple.CanDataReceiverSimple (raw 64B 데이터 프레임)
-- 수신기(CanDataReceiverSimple)가 hexdump 프린트 + "radar packet YYYY-MM-DD HH-mm-ss.log" 저장 수행
+- TX: can_simple_sender.CanSimpleSender
+- RX: can_simple_receiver.CanSimpleReceiver (raw 64B 데이터 프레임)
+- 수신기(CanSimpleReceiver)가 hexdump 프린트 + "radar packet YYYY-MM-DD HH-mm-ss.log" 저장 수행
 - GUI는 수신 프레임을 스레드 세이프하게 콘솔에 표시(파일 저장은 중복 방지 위해 GUI에서 하지 않음)
 
 필요:
@@ -27,18 +27,18 @@ from PyQt6.QtWidgets import (
 
 # -------- Backend (TX) --------
 try:
-    from can_cli_command_sender import CanCliCommandSender
+    from can_simple_sender import CanSimpleSender
     _be_err = None
 except Exception as e:
-    CanCliCommandSender = None  # type: ignore
+    CanSimpleSender = None  # type: ignore
     _be_err = e
 
 # -------- Receiver (RX: simple raw) --------
 try:
-    from can_data_receiver_simple import CanDataReceiverSimple as CanDataReceiver
+    from can_simple_receiver import CanSimpleReceiver
     _rx_err = None
 except Exception as e:
-    CanDataReceiver = None  # type: ignore
+    CanSimpleReceiver = None  # type: ignore
     _rx_err = e
 
 # -------- PCANManager (fallback용) --------
@@ -55,7 +55,7 @@ class SendWorker(QThread):
     error = pyqtSignal(str)
     finishedOk = pyqtSignal()
 
-    def __init__(self, sender: "CanCliCommandSender", lines: List[str]):
+    def __init__(self, sender: "CanSimpleSender", lines: List[str]):
         super().__init__()
         self.sender = sender
         self.lines = lines
@@ -97,7 +97,7 @@ class ReceiveWorker(QThread):
     rxBinary = pyqtSignal(bytes, int)  # 바이너리, CAN ID
     error = pyqtSignal(str)
 
-    def __init__(self, receiver: "CanDataReceiver", timeout_s: float, verbose: bool):
+    def __init__(self, receiver: "CanSimpleReceiver", timeout_s: float, verbose: bool):
         super().__init__()
         self.receiver = receiver
         self.timeout_s = timeout_s
@@ -145,15 +145,15 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("CAN Sender/Receiver (Simple) - PyQt6")
         self.resize(1280, 860)
 
-        if CanCliCommandSender is None:
-            QMessageBox.critical(self, "오류", f"백엔드(can_cli_command_sender) import 실패: {_be_err}")
-        if CanDataReceiver is None:
-            QMessageBox.critical(self, "오류", f"수신기(can_data_receiver_simple) import 실패: {_rx_err}")
+        if CanSimpleSender is None:
+            QMessageBox.critical(self, "오류", f"백엔드(can_custom_sender) import 실패: {_be_err}")
+        if CanSimpleReceiver is None:
+            QMessageBox.critical(self, "오류", f"수신기(can_custom_receiver_simple) import 실패: {_rx_err}")
 
         self.txWorker: Optional[SendWorker] = None
         self.rxWorker: Optional[ReceiveWorker] = None
-        self.sender: Optional["CanCliCommandSender"] = None
-        self._rx_receiver: Optional[CanDataReceiver] = None
+        self.sender: Optional["CanSimpleSender"] = None
+        self._rx_receiver: Optional[CanSimpleReceiver] = None
 
         self._rx_mgr_owned = False
         self._rx_mgr = None
@@ -193,7 +193,7 @@ class MainWindow(QMainWindow):
         row.addStretch(1)
         row.addWidget(self.btnConnect); row.addWidget(self.btnDisconnect)
 
-        gbConn = QGroupBox("Connection (TX: CanCliCommandSender, RX: CanDataReceiverSimple)")
+        gbConn = QGroupBox("Connection (TX: CanSimpleSender, RX: CanReceiverSimple)")
         layConn = QVBoxLayout(); layConn.addLayout(row); gbConn.setLayout(layConn)
 
         # ---------------- 중앙: 좌(리스트) / 우(에디터) ----------------
@@ -327,7 +327,7 @@ class MainWindow(QMainWindow):
 
     # ================= Connect/Disconnect =================
     def on_connect(self):
-        if CanCliCommandSender is None or CanDataReceiver is None:
+        if CanSimpleSender is None or CanSimpleReceiver is None:
             self._err("백엔드/수신기 import 실패")
             return
 
@@ -337,7 +337,7 @@ class MainWindow(QMainWindow):
 
         try:
             # 1) TX 연결
-            self.sender = CanCliCommandSender(
+            self.sender = CanSimpleSender(
                 channel=self.edChannel.text().strip(),
                 bitrate_fd=self.edBitrate.text().strip(),
             )
@@ -374,10 +374,10 @@ class MainWindow(QMainWindow):
             # 3) 수신기 생성 (다중 ID)
             filter_ids = self._parse_filter_ids()
             try:
-                self._rx_receiver = CanDataReceiver(rx_mgr, filter_can_ids=filter_ids)
+                self._rx_receiver = CanSimpleReceiver(rx_mgr, filter_can_ids=filter_ids)
             except TypeError:
                 one = None if not filter_ids else next(iter(filter_ids))
-                self._rx_receiver = CanDataReceiver(rx_mgr, filter_can_id=one)
+                self._rx_receiver = CanSimpleReceiver(rx_mgr, filter_can_id=one)
 
             # 4) 수신기가 사용할 로그 파일 경로 안내
             rx_log = getattr(self._rx_receiver, "_log_path", None)

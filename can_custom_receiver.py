@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 """
-can_data_receiver.py
+can_custom_receiver.py
 
 프레이밍 규약:
   - frame[0] = HDR (1B)
@@ -17,7 +17,7 @@ can_data_receiver.py
   - **완성 패킷 조립 시 hexdump 콘솔 출력(코드 검증용)**
 
 단독 실행 예:
-  python can_data_receiver.py --channel PCAN_USBBUS1 --bitrate-fd "..." --filter-ids "0xD1,0x200-0x20F"
+  python can_custom_receiver.py --channel PCAN_USBBUS1 --bitrate-fd "..." --filter-ids "0xD1,0x200-0x20F"
 """
 
 from __future__ import annotations
@@ -86,7 +86,7 @@ class _AsmState:
 
 
 # ---------- 메인 클래스 ----------
-class CanDataReceiver:
+class CanCustomReceiver:
     """
     완성 메시지 수신기 (프레이밍 조립 포함)
 
@@ -437,7 +437,7 @@ def main():
 
     # 수신기 생성
     filter_ids = _parse_filter_ids(args.filter_ids)
-    rx = CanDataReceiver(mgr, filter_can_ids=filter_ids, assembly_timeout_s=float(args.asm_timeout_s))
+    rx = CanCustomReceiver(mgr, filter_can_ids=filter_ids, assembly_timeout_s=float(args.asm_timeout_s))
 
     print("[INFO] CAN Receiver 시작", flush=True)
     print(f"       channel={args.channel}", flush=True)

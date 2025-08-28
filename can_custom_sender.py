@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-can_cli_command_sender.py  (class-based)
+can_custom_sender.py  (class-based)
 
 표준 API (GUI/스크립트에서 호출):
-    CanCliCommandSender.connect(channel: str, bitrate_fd: str) -> None
-    CanCliCommandSender.disconnect() -> None
-    CanCliCommandSender.send_line(text: str) -> None
-    CanCliCommandSender.send_lines(lines: list[str]) -> None
-    CanCliCommandSender.start_repl(on_rx: Callable[[str, int], None]) -> None
-    CanCliCommandSender.stop_repl() -> None
+    CanCustomSender.connect(channel: str, bitrate_fd: str) -> None
+    CanCustomSender.disconnect() -> None
+    CanCustomSender.send_line(text: str) -> None
+    CanCustomSender.send_lines(lines: list[str]) -> None
+    CanCustomSender.start_repl(on_rx: Callable[[str, int], None]) -> None
+    CanCustomSender.stop_repl() -> None
 
 프레이밍 (64B 고정, FD DLC=15):
   - frame[0] = HDR (1B)
@@ -58,7 +58,7 @@ else:
     _PM_IMPORT_ERROR = None
 
 
-class CanCliCommandSender:
+class CanCustomSender:
     """PCAN 기반 CAN-FD(64B) CLI 송수신기 (프레이밍 포함)."""
 
     def __init__(
@@ -331,12 +331,12 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     # 인스턴스 생성
     try:
-        can_id = CanCliCommandSender.parse_can_id(str(args.can_id))
+        can_id = CanCustomSender.parse_can_id(str(args.can_id))
     except Exception as e:
         print(f"[ERR] CAN ID 파싱 실패: {e}", file=sys.stderr)
         return 2
 
-    sender = CanCliCommandSender(
+    sender = CanCustomSender(
         channel=args.channel,
         bitrate_fd=args.bitrate_fd,
         can_id_11bit=can_id,
@@ -365,7 +365,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     if args.load:
         try:
-            lines = CanCliCommandSender.load_text_file(args.load)
+            lines = CanCustomSender.load_text_file(args.load)
             sender.send_lines(lines)
         except Exception as e:
             print(f"[ERR] 파일 전송 실패: {e}")
@@ -422,7 +422,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                     print(f"[ERR] 파일을 찾을 수 없습니다: {path}")
                     continue
                 try:
-                    lines = CanCliCommandSender.load_text_file(path)
+                    lines = CanCustomSender.load_text_file(path)
                     sender.send_lines(lines)
                     print(f"[INFO] 전송 완료: {len(lines)} lines from {path}")
                 except Exception as e:
@@ -431,7 +431,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             if line.startswith(":id "):
                 val = line[4:].strip()
                 try:
-                    sender.can_id_11bit = CanCliCommandSender.parse_can_id(val)
+                    sender.can_id_11bit = CanCustomSender.parse_can_id(val)
                     print(f"[INFO] CAN ID 변경: {hex(sender.can_id_11bit)}")
                 except Exception as e:
                     print(f"[ERR] 잘못된 ID: {e}")

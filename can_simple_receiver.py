@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 """
-can_data_receiver_simple.py
+can_custom_receiver_simple.py
 
 - PCANManager를 공용으로 사용하여 CAN FD 프레임(최대 64B) 연속 수신
 - 수신 시 hexdump 프린트 + 파일 저장(패킷 간 1줄 공백)
@@ -87,7 +87,7 @@ def _nonzero(b: bytes) -> bool:
 
 
 # -------------------- 메인 클래스 --------------------
-class CanDataReceiverSimple:
+class CanSimpleReceiver:
     """
     간단 수신기:
       - mgr: PCANManager 인스턴스 (open() 완료 상태 권장)
@@ -312,7 +312,7 @@ class CanDataReceiverSimple:
 def main():
     """
     간단 실행:
-        python can_data_receiver_simple.py
+        python can_custom_receiver_simple.py
     환경변수:
         PCAN_CHANNEL   (기본: PCAN_USBBUS1)
         PCAN_BITRATEFD (기본: 레포 예제값)
@@ -360,7 +360,7 @@ def main():
     mgr.open(channel, bitrate_fd, ifg_us=ifg_us)
 
     # 수신기 생성
-    rx = CanDataReceiverSimple(mgr, filter_can_ids=filter_ids)
+    rx = CanSimpleReceiver(mgr, filter_can_ids=filter_ids)
 
     print("Receiving frames continuously... (Ctrl+C to stop)")
 

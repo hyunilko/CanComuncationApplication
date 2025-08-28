@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# can_cli_command_sender_simple.py
+# can_custom_sender_simple.py
 
 import argparse
 from PCANBasic import *
@@ -9,7 +9,7 @@ import time
 import os
 
 
-class CanCliCommandSenderSimple:
+class CanSimpleSender:
     def __init__(self, channel=PCAN_USBBUS1,
                  bitrate_fd="f_clock=80000000,nom_brp=2,nom_tseg1=33,nom_tseg2=6,nom_sjw=1,data_brp=2,data_tseg1=6,data_tseg2=1,data_sjw=1,data_ssp_offset=14"):
         self.pcan = PCANBasic()
@@ -149,7 +149,7 @@ def main():
     args = parser.parse_args()
 
     try:
-        sender = CanCliCommandSenderSimple()
+        sender = CanSimpleSender()
 
         if args.interactive or not (args.command or args.file or args.all):
             sender.interactive_mode()
