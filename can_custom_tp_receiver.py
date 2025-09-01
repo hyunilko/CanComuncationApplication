@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 """
-can_custom_receiver.py
+can_custom_tp_receiver.py
 
 프레이밍 규약:
   - frame[0] = HDR (1B)
@@ -17,7 +17,7 @@ can_custom_receiver.py
   - **완성 패킷 조립 시 hexdump 콘솔 출력(코드 검증용)**
 
 단독 실행 예:
-  python can_custom_receiver.py --channel PCAN_USBBUS1 --bitrate-fd "..." --filter-ids "0xD1,0x200-0x20F"
+  python can_custom_tp_receiver.py --channel PCAN_USBBUS1 --bitrate-fd "..." --filter-ids "0xD1,0x200-0x20F"
 """
 
 from __future__ import annotations
@@ -86,7 +86,7 @@ class _AsmState:
 
 
 # ---------- 메인 클래스 ----------
-class CanCustomReceiver:
+class CanCustomTpReceiver:
     """
     완성 메시지 수신기 (프레이밍 조립 포함)
 
@@ -148,9 +148,8 @@ class CanCustomReceiver:
                     self._mgr.start_rx(on_frame=_cb)  # type: ignore
                     return
             except Exception:
-                pass  # 폴링으로 폴백
+                pass
 
-        # 2) 내부 폴링 스레드
         def _loop():
             while not self._rx_stop.is_set():
                 try:
@@ -167,14 +166,12 @@ class CanCustomReceiver:
         self._rx_thread.start()
 
     def stop_rx(self):
-        # PCANManager 콜백모드 중지
         try:
             if hasattr(self._mgr, "stop_rx"):
                 self._mgr.stop_rx()  # type: ignore
         except Exception:
             pass
 
-        # 폴링 스레드 중지
         self._rx_stop.set()
         if self._rx_thread and self._rx_thread.is_alive():
             try:
@@ -183,7 +180,6 @@ class CanCustomReceiver:
                 pass
         self._rx_thread = None
 
-    # 폴링 강제 시작(옵션)
     def start_polling(self, poll_interval_s: float = 0.001):
         if self._rx_thread and self._rx_thread.is_alive():
             return
@@ -222,7 +218,6 @@ class CanCustomReceiver:
     def _pass_filter(self, can_id: int) -> bool:
         return (self._filters is None) or (can_id in self._filters)
 
-    # -- hexdump 출력 (완성 패킷용) --
     @staticmethod
     def _hexdump_print(can_id: int, payload: bytes):
         ts = time.strftime("%H:%M:%S")
@@ -248,7 +243,7 @@ class CanCustomReceiver:
             return
 
         hdr = frame[0]
-        data = frame[1:64]  # 실제 받은 길이에 따라 짧을 수 있음
+        data = frame[1:64]
 
         is_last = bool(hdr & 0x80)
         low7 = hdr & 0x7F
@@ -300,7 +295,6 @@ class CanCustomReceiver:
         self._gc_stale_one(can_id, st)
 
     def _on_completed(self, can_id: int, payload: bytes):
-        # 큐/콜백 전달
         try:
             self._complete_q.put_nowait((payload, can_id))
         except Exception:
@@ -427,7 +421,6 @@ def main():
     parser.add_argument("--asm-timeout-s", type=float, default=2.0, help="조립 타임아웃(초)")
     args = parser.parse_args()
 
-    # 매니저 오픈
     mgr = PCANManager()
     try:
         mgr.open(args.channel, args.bitrate_fd, ifg_us=int(args.ifg_us))
@@ -435,9 +428,8 @@ def main():
         print(f"[ERR] PCAN open 실패: {e}", file=sys.stderr)
         sys.exit(3)
 
-    # 수신기 생성
     filter_ids = _parse_filter_ids(args.filter_ids)
-    rx = CanCustomReceiver(mgr, filter_can_ids=filter_ids, assembly_timeout_s=float(args.asm_timeout_s))
+    rx = CanCustomTpReceiver(mgr, filter_can_ids=filter_ids, assembly_timeout_s=float(args.asm_timeout_s))
 
     print("[INFO] CAN Receiver 시작", flush=True)
     print(f"       channel={args.channel}", flush=True)
@@ -448,18 +440,14 @@ def main():
 
     try:
         if args.mode == "callback":
-            # 콜백은 hexdump를 내부에서 이미 출력함 → 여기선 아무 것도 안 해도 됨
             def _on_pkt(_data: bytes, _cid: int):
-                # hexdump는 클래스 내부에서 이미 출력됨(중복 방지)
                 pass
             rx.start_rx(on_packet=_on_pkt)
             while True:
                 time.sleep(0.2)
         else:
-            # poll 모드: receive_packet() 루프
             while True:
                 pkt = rx.receive_packet(timeout_s=float(args.timeout_s))
-                # hexdump는 _handle_raw_frame()에서 완료시 이미 출력됨
                 _ = pkt
     except KeyboardInterrupt:
         print("\n[INFO] Stopping...", flush=True)

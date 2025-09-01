@@ -1,20 +1,26 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-
 """
-can_custom_manager_gui.py (stable)
+can_custom_tp_manager_gui.py (stable, App PDU aware)
 
 - PyQt6 GUI for CAN CLI
-- TX: can_custom_sender.CanCustomSender
-- RX: can_custom_receiver.CanCustomReceiver (조립 완료 '완성 패킷' 수신)
-- 모든 수신 패킷을 "radar packet YYYY-MM-DD HH-mm-ss.log" 로 안전 저장
-- UI 업데이트는 반드시 메인 스레드에서만 수행 (스레드-세이프)
+- TX: prefers CanCustomTpSender.send_app_pdu(msg_id:int, payload:bytes)
+      falls back to local framer (HDR + APP_PDU) if sender lacks that API
+- RX: CanCustomTpReceiver assembles complete payloads; GUI treats first byte
+      as App Msg ID, rest as payload (text/hex shown separately)
+- Every received complete APP_PDU is saved to a timestamped log file
+  ("radar packet YYYY-MM-DD HH-mm-ss.log").
+
+Application Layer: Application PDU = MsgID(1B) + Payload
+Transport Layer (Custom‑TP):  HDR(1B) + APP_PDU( Msg ID(1B) + Payload )
+  HDR(1B): bit7=0 → MIDDLE (SEQ 0..127), bit7=1 → LAST (len 1..63)
+  DATA:    frame[1:64] = 63B (LAST는 last_len만 유효, 나머지 0 패딩)
 
 pip install PyQt6
 """
 
 from __future__ import annotations
-from typing import List, Optional, Set
+from typing import List, Optional, Set, Tuple, Callable
 import sys, os, re, binascii, queue
 from datetime import datetime
 
@@ -27,18 +33,18 @@ from PyQt6.QtWidgets import (
 
 # -------- Backend (TX) --------
 try:
-    from can_custom_sender import CanCustomSender
+    from can_custom_tp_sender import CanCustomTpSender
     _be_err = None
 except Exception as e:
-    CanCustomSender = None  # type: ignore
+    CanCustomTpSender = None  # type: ignore
     _be_err = e
 
 # -------- Receiver (RX) --------
 try:
-    from can_custom_receiver import CanCustomReceiver
+    from can_custom_tp_receiver import CanCustomTpReceiver
     _rx_err = None
 except Exception as e:
-    CanCustomReceiver = None  # type: ignore
+    CanCustomTpReceiver = None  # type: ignore
     _rx_err = e
 
 # -------- PCANManager (fallback용) --------
@@ -46,6 +52,11 @@ try:
     from pcan_manager import PCANManager
 except Exception:
     PCANManager = None  # type: ignore
+
+# ========= Transport constants =========
+CHUNK_DATA_MAX = 63  # bytes per frame after HDR
+HDR_LAST_BIT = 0x80  # bit7
+SEQ_MASK = 0x7F      # 0..127
 
 
 # ================= 유틸: 필터 파서 =================
@@ -75,30 +86,19 @@ class SendWorker(QThread):
     error = pyqtSignal(str)
     finishedOk = pyqtSignal()
 
-    def __init__(self, sender: "CanCustomSender", lines: List[str]):
+    def __init__(self, send_fn: Callable[[str], None], lines: List[str]):
         super().__init__()
-        self.sender = sender
+        self._send_fn = send_fn
         self.lines = lines
         self._stop = False
 
     def run(self):
         try:
             total = len(self.lines)
-            try:
-                self.sender.send_lines(self.lines)
-                for i, line in enumerate(self.lines, 1):
-                    if self._stop:
-                        break
-                    self.lineSent.emit(line)
-                    self.progress.emit(int(i * 100 / max(1, total)))
-                self.finishedOk.emit()
-                return
-            except Exception:
-                pass
             for i, line in enumerate(self.lines, 1):
                 if self._stop:
                     break
-                self.sender.send_line(line)
+                self._send_fn(line)
                 self.lineSent.emit(line)
                 self.progress.emit(int(i * 100 / max(1, total)))
             self.finishedOk.emit()
@@ -124,9 +124,9 @@ class PacketLoggerWorker(QThread):
         self._write_count = 0
         self._dropped = 0
 
-    def enqueue(self, can_id: int, data: bytes):
+    def enqueue(self, can_id: int, app_pdu: bytes):
         try:
-            self._q.put_nowait((can_id, data))
+            self._q.put_nowait((can_id, app_pdu))
         except queue.Full:
             self._dropped += 1
             if self._dropped % 100 == 1:
@@ -141,13 +141,18 @@ class PacketLoggerWorker(QThread):
         try:
             while not self._stop:
                 try:
-                    can_id, data = self._q.get(timeout=0.2)
+                    can_id, app_pdu = self._q.get(timeout=0.2)
                 except queue.Empty:
                     continue
                 try:
-                    hexstr = binascii.hexlify(data).decode("ascii").upper()
-                    self._file.write(f"CAN ID: 0x{can_id:X}\n")
-                    self._file.write(hexstr + "\n\n")  # 패킷 구분용 빈 줄
+                    hexstr = binascii.hexlify(app_pdu).decode("ascii").upper()
+                    pdu_len = len(app_pdu)
+                    msg_id = app_pdu[0] if pdu_len > 0 else 0
+                    payload_len = max(0, pdu_len - 1)
+                    self._file.write(
+                        f"MSG_ID: 0x{msg_id:02X} PDU_LEN(B): {pdu_len} PAYLOAD_LEN(B): {payload_len}\n"
+                    )
+                    self._file.write(f"APP_PDU: {hexstr}\n\n")
                     self._write_count += 1
                     if (self._write_count % self._flush_every) == 0:
                         self._file.flush()
@@ -167,30 +172,24 @@ class PacketLoggerWorker(QThread):
 
 # ================= 폴링 수신 워커 (콜백 실패 시 폴백) =================
 class PollWorker(QThread):
-    rxText = pyqtSignal(str, int)
-    rxBinary = pyqtSignal(bytes, int)
+    rxAppPdu = pyqtSignal(bytes, int)  # (app_pdu, can_id)
     error = pyqtSignal(str)
 
-    def __init__(self, receiver: "CanCustomReceiver", timeout_s: float, verbose: bool):
+    def __init__(self, receiver: "CanCustomTpReceiver", timeout_s: float):
         super().__init__()
         self.receiver = receiver
         self.timeout_s = timeout_s
-        self.verbose = verbose
         self._stop = False
 
     def run(self):
         try:
             while not self._stop:
-                pkt = self.receiver.receive_packet(timeout_s=self.timeout_s, verbose=self.verbose)
+                pkt = self.receiver.receive_packet(timeout_s=self.timeout_s)
                 if pkt is None:
                     self.msleep(2)
                     continue
-                data, can_id = pkt
-                try:
-                    text = data.decode("utf-8")
-                    self.rxText.emit(text, can_id)
-                except UnicodeDecodeError:
-                    self.rxBinary.emit(data, can_id)
+                data, can_id = pkt  # data == APP_PDU
+                self.rxAppPdu.emit(data, can_id)
         except Exception as e:
             self.error.emit(str(e))
 
@@ -200,8 +199,7 @@ class PollWorker(QThread):
 
 # ================= UI 브리지(메인 스레드에서만 UI 갱신) =================
 class UiBridge(QObject):
-    rx_bin = pyqtSignal(int, object)   # (can_id, bytes)
-    rx_txt = pyqtSignal(int, str)      # (can_id, text)
+    rx_app_pdu = pyqtSignal(int, object)   # (can_id, bytes)
     log_msg = pyqtSignal(str)
 
 
@@ -209,27 +207,26 @@ class UiBridge(QObject):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("CAN Sender/Receiver (Framed) - PyQt6")
-        self.resize(1280, 860)
+        self.setWindowTitle("CAN Sender/Receiver (Custom-TP, AppPDU aware) - PyQt6")
+        self.resize(1280, 900)
 
-        if CanCustomSender is None:
-            QMessageBox.critical(self, "오류", f"백엔드(can_custom_sender) import 실패: {_be_err}")
-        if CanCustomReceiver is None:
-            QMessageBox.critical(self, "오류", f"수신기(can_custom_receiver) import 실패: {_rx_err}")
+        if CanCustomTpSender is None:
+            QMessageBox.critical(self, "오류", f"백엔드(can_custom_tp_sender) import 실패: {_be_err}")
+        if CanCustomTpReceiver is None:
+            QMessageBox.critical(self, "오류", f"수신기(can_custom_tp_receiver) import 실패: {_rx_err}")
 
         self.txWorker: Optional[SendWorker] = None
         self.pollWorker: Optional[PollWorker] = None
         self.loggerWorker: Optional[PacketLoggerWorker] = None
-        self.sender: Optional["CanCustomSender"] = None
-        self._rx_receiver: Optional[CanCustomReceiver] = None
+        self.sender: Optional["CanCustomTpSender"] = None
+        self._rx_receiver: Optional[CanCustomTpReceiver] = None
 
         self._rx_mgr_owned = False
         self._rx_mgr = None
 
         # ---- UI 브리지(메인스레드 시그널로만 UI수정) ----
         self.uiBus = UiBridge()
-        self.uiBus.rx_bin.connect(self._on_ui_rx_bin)
-        self.uiBus.rx_txt.connect(self._on_ui_rx_txt)
+        self.uiBus.rx_app_pdu.connect(self._on_ui_rx_app_pdu)
         self.uiBus.log_msg.connect(self._append_log)
 
         # ---------------- 상단: 연결/수신 설정 ----------------
@@ -242,26 +239,31 @@ class MainWindow(QMainWindow):
         self.edFilterIds = QLineEdit("")  # 빈칸=전체
         self.edFilterIds.setPlaceholderText("예: 0xD1, 0x200-0x20F  (빈칸=전체)")
         self.edTimeout = QSpinBox(); self.edTimeout.setRange(1, 120); self.edTimeout.setValue(30)
-        self.chkVerbose = QCheckBox("RX verbose"); self.chkVerbose.setChecked(False)
+
+        # === App Layer: Msg ID (1B) 설정 ===
+        self.edMsgId = QSpinBox(); self.edMsgId.setRange(0, 255); self.edMsgId.setValue(0xFA)
+        self.chkAppendLF = QCheckBox("Append LF on send"); self.chkAppendLF.setChecked(True)
 
         self.btnConnect = QPushButton("Connect")
         self.btnDisconnect = QPushButton("Disconnect"); self.btnDisconnect.setEnabled(False)
 
         row = QHBoxLayout()
         row.addWidget(QLabel("Channel")); row.addWidget(self.edChannel)
-        row.addSpacing(10)
+        row.addSpacing(8)
         row.addWidget(QLabel("BitrateFD")); row.addWidget(self.edBitrate)
-        row.addSpacing(10)
+        row.addSpacing(8)
         row.addWidget(QLabel("IFG us")); row.addWidget(self.edIfg)
-        row.addSpacing(10)
+        row.addSpacing(8)
         row.addWidget(QLabel("Filter IDs")); row.addWidget(self.edFilterIds)
-        row.addSpacing(10)
+        row.addSpacing(8)
         row.addWidget(QLabel("Timeout s")); row.addWidget(self.edTimeout)
-        row.addWidget(self.chkVerbose)
+        row.addSpacing(8)
+        row.addWidget(QLabel("App MsgID")); row.addWidget(self.edMsgId)
+        row.addWidget(self.chkAppendLF)
         row.addStretch(1)
         row.addWidget(self.btnConnect); row.addWidget(self.btnDisconnect)
 
-        gbConn = QGroupBox("Connection (TX: CanCustomSender, RX: CanCustomReceiver)")
+        gbConn = QGroupBox("Connection (TX: CanCustomTpSender, RX: CanCustomTpReceiver) + App PDU")
         layConn = QVBoxLayout(); layConn.addLayout(row); gbConn.setLayout(layConn)
 
         # ---------------- 중앙: 좌/우 ----------------
@@ -279,8 +281,8 @@ class MainWindow(QMainWindow):
         self.chkSkipEmpty = QCheckBox("공백 스킵"); self.chkSkipEmpty.setChecked(True)
 
         self.btnOpen = QPushButton("파일 열기")
-        self.btnSendAll = QPushButton("전체 전송")
-        self.btnSendSelected = QPushButton("선택 전송")
+        self.btnSendAll = QPushButton("전체 전송 (AppPDU)")
+        self.btnSendSelected = QPushButton("선택 전송 (AppPDU)")
         self.btnStop = QPushButton("중지"); self.btnStop.setEnabled(False)
         self.btnClear = QPushButton("로그 지우기")
 
@@ -298,9 +300,9 @@ class MainWindow(QMainWindow):
         self.progress = QProgressBar(); self.progress.setRange(0, 100)
         self.log = QTextEdit(); self.log.setReadOnly(True)
         self.console = QTextEdit(); self.console.setReadOnly(True)
-        self.console.setPlaceholderText("완성 패킷 요약(hex) 표시")
+        self.console.setPlaceholderText("완성 App PDU 요약(hex) 표시")
         self.consoleInput = QLineEdit()
-        self.consoleInput.setPlaceholderText("단일 명령 입력. ↑/↓=히스토리, Ctrl+L=클리어")
+        self.consoleInput.setPlaceholderText("단일 명령 입력 (AppPDU로 전송). ↑/↓=히스토리, Ctrl+L=클리어")
         self.hist: List[str] = []; self.hidx: int = 0
 
         # 메모리/성능 보호: 최대 라인 제한
@@ -369,7 +371,7 @@ class MainWindow(QMainWindow):
 
     # ---------- Connect / Disconnect ----------
     def on_connect(self):
-        if CanCustomSender is None or CanCustomReceiver is None:
+        if CanCustomTpSender is None or CanCustomTpReceiver is None:
             self._err("백엔드/수신기 import 실패")
             return
 
@@ -379,10 +381,15 @@ class MainWindow(QMainWindow):
 
         try:
             # TX
-            self.sender = CanCustomSender(
+            self.sender = CanCustomTpSender(
                 channel=self.edChannel.text().strip(),
                 bitrate_fd=self.edBitrate.text().strip(),
             )
+            # apply LF preference to sender if available
+            try:
+                self.sender.append_lf = bool(self.chkAppendLF.isChecked())
+            except Exception:
+                pass
             self.sender.connect(ifg_us=int(self.edIfg.value()))
             self._append_log("[INFO] TX 연결 완료")
 
@@ -411,8 +418,8 @@ class MainWindow(QMainWindow):
                 self._rx_mgr_owned = False
             self._rx_mgr = rx_mgr
 
-            # 로그 파일 준비
-            ts = datetime.now().strftime("%Y-%m-%d %H-%M-%S")  # Windows ':' 금지 → '-' 사용
+            # 로그 파일 준비 (':' 대신 '-' 사용: Windows 호환)
+            ts = datetime.now().strftime("%Y-%m-%d %H-%M-%S")
             log_name = f"radar packet {ts}.log"
             log_path = os.path.abspath(log_name)
             self.loggerWorker = PacketLoggerWorker(log_path, flush_every=20)
@@ -425,22 +432,20 @@ class MainWindow(QMainWindow):
 
             # 수신기
             filter_ids = _parse_filter_ids(self.edFilterIds.text())
-            self._rx_receiver = CanCustomReceiver(rx_mgr, filter_can_ids=filter_ids)
+            self._rx_receiver = CanCustomTpReceiver(rx_mgr, filter_can_ids=filter_ids)
 
             # 콜백(백그라운드 스레드) → 메인 스레드 신호만 발생
-            def _on_complete_packet(data: bytes, can_id: int):
+            def _on_complete_packet(app_pdu: bytes, can_id: int):
                 try:
                     if self.loggerWorker is not None:
-                        self.loggerWorker.enqueue(int(can_id), bytes(data))
+                        self.loggerWorker.enqueue(int(can_id), bytes(app_pdu))
                 except Exception:
                     pass
-                # UI는 직접 만지지 않고, 신호로 전달
                 try:
-                    self.uiBus.rx_bin.emit(int(can_id), bytes(data))
+                    self.uiBus.rx_app_pdu.emit(int(can_id), bytes(app_pdu))
                 except Exception:
                     pass
 
-            # 콜백 기반 연속 수신 시도
             started_callback = False
             try:
                 self._rx_receiver.start_rx(on_packet=_on_complete_packet)
@@ -449,15 +454,13 @@ class MainWindow(QMainWindow):
             except Exception as e:
                 self._append_log(f"[WARN] start_rx 실패 → 폴링으로 폴백: {e}")
 
-            # 폴링 폴백 경로: PollWorker 시그널 → 메인스레드 슬롯
+            # 폴링 폴백 경로
             if not started_callback:
                 self.pollWorker = PollWorker(
                     receiver=self._rx_receiver,
-                    timeout_s=float(self.edTimeout.value()),
-                    verbose=self.chkVerbose.isChecked()
+                    timeout_s=float(self.edTimeout.value())
                 )
-                self.pollWorker.rxBinary.connect(self._on_worker_rx_bin)
-                self.pollWorker.rxText.connect(self._on_worker_rx_text)
+                self.pollWorker.rxAppPdu.connect(self._on_worker_rx_app_pdu)
                 self.pollWorker.error.connect(lambda msg: self.console.append(f"[RX-ERR] {msg}"))
                 self.pollWorker.start()
                 self._append_log("[INFO] RX: 폴링 기반 연속 수신 시작")
@@ -473,42 +476,43 @@ class MainWindow(QMainWindow):
             self._err(str(e))
 
     # PollWorker → 메인스레드 슬롯
-    def _on_worker_rx_bin(self, data: bytes, can_id: int):
+    def _on_worker_rx_app_pdu(self, app_pdu: bytes, can_id: int):
         try:
             if self.loggerWorker is not None:
-                self.loggerWorker.enqueue(int(can_id), bytes(data))
+                self.loggerWorker.enqueue(int(can_id), bytes(app_pdu))
         except Exception:
             pass
-        self.uiBus.rx_bin.emit(int(can_id), bytes(data))
+        self.uiBus.rx_app_pdu.emit(int(can_id), bytes(app_pdu))
 
-    def _on_worker_rx_text(self, text: str, can_id: int):
-        b = text.encode("utf-8", "replace")
+    def _append_console_app_pdu(self, can_id: int, app_pdu: bytes):
         try:
-            if self.loggerWorker is not None:
-                self.loggerWorker.enqueue(int(can_id), b)
+            if not app_pdu:
+                self.console.append(f"CAN ID: 0x{can_id:X}\n<EMPTY>\n")
+                return
+            msg_id = app_pdu[0]
+            payload = app_pdu[1:]
+            hex_payload = binascii.hexlify(payload).decode("ascii").upper()
+
+            try:
+                txt = payload.decode("utf-8")
+                if len(txt) > 512:
+                    txt = txt[:512] + "..."
+            except UnicodeDecodeError:
+                txt = ""
+            self.console.append(
+                f"MSG_ID: 0x{msg_id:02X} PDU({len(app_pdu)}B) PAYLOAD({len(payload)}B)\n"
+                f"{hex_payload}\n"
+                + (f"TEXT: {txt}\n" if txt else "")
+            )
         except Exception:
             pass
-        self.uiBus.rx_txt.emit(int(can_id), text)
 
-    def _append_console_hex(self, can_id: int, data: bytes):
+    def _on_ui_rx_app_pdu(self, can_id: int, data_obj: object):
         try:
-            hexstr = binascii.hexlify(data).decode("ascii").upper()
-            if len(hexstr) > 256:
-                hexstr = hexstr[:256] + "..."
-            self.console.append(f"CAN ID: 0x{can_id:X}\n{hexstr}\n")
-        except Exception:
-            pass
-
-    # 메인스레드 UI 브리지 슬롯
-    def _on_ui_rx_bin(self, can_id: int, data_obj: object):
-        try:
-            data = bytes(data_obj) if not isinstance(data_obj, (bytes, bytearray)) else bytes(data_obj)
+            app_pdu = bytes(data_obj) if not isinstance(data_obj, (bytes, bytearray)) else bytes(data_obj)
         except Exception:
             return
-        self._append_console_hex(can_id, data)
-
-    def _on_ui_rx_txt(self, can_id: int, text: str):
-        self.console.append(f"CAN ID: 0x{can_id:X}\n{text}\n")
+        self._append_console_app_pdu(can_id, app_pdu)
 
     def _teardown_on_error(self):
         try:
@@ -601,7 +605,87 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("Disconnected")
         self._append_log("[INFO] 연결 해제")
 
-    # ---------- 전송 ----------
+    # ---------- 전송 (AppPDU 적용) ----------
+    def _build_app_pdu(self, text_line: str, msg_id: int, append_lf: bool) -> bytes:
+        payload = text_line.encode("ascii", errors="ignore")
+        if append_lf:
+            payload += b"\n"
+        return bytes([msg_id & 0xFF]) + payload
+
+    def _local_frame_bytes(self, app_pdu: bytes) -> List[bytes]:
+        """Transport(Custom-TP)로 직접 프레이밍 (HDR + DATA[63])."""
+        frames: List[bytes] = []
+        n = len(app_pdu)
+        pos = 0
+        seq = 0
+        # MIDDLE
+        while (n - pos) > CHUNK_DATA_MAX:
+            hdr = seq & SEQ_MASK  # bit7=0
+            chunk = app_pdu[pos:pos + CHUNK_DATA_MAX]
+            if len(chunk) != CHUNK_DATA_MAX:
+                chunk = chunk.ljust(CHUNK_DATA_MAX, b"\x00")
+            frames.append(bytes([hdr]) + chunk)
+            pos += CHUNK_DATA_MAX
+            seq = (seq + 1) & SEQ_MASK
+        # LAST
+        last_len = n - pos
+        if last_len <= 0:
+            last_len = 1
+        if last_len > CHUNK_DATA_MAX:
+            last_len = CHUNK_DATA_MAX
+        hdr = HDR_LAST_BIT | (last_len & SEQ_MASK)
+        last_chunk = app_pdu[pos:pos + last_len]
+        pad = b"\x00" * (CHUNK_DATA_MAX - last_len)
+        frames.append(bytes([hdr]) + last_chunk + pad)
+        return frames
+
+    def _send_one_line_app(self, line: str):
+        if self.sender is None:
+            raise RuntimeError("Sender not connected")
+        msg_id = int(self.edMsgId.value()) & 0xFF
+        app_pdu = self._build_app_pdu(line, msg_id, append_lf=self.chkAppendLF.isChecked())
+
+        # 1) 공식 API가 있으면 사용
+        try:
+            if hasattr(self.sender, "send_app_pdu"):
+                # type: ignore[attr-defined]
+                self.sender.send_app_pdu(msg_id, app_pdu[1:])
+                return
+        except Exception:
+            pass
+
+        # 2) 백엔드 내부 매니저로 직접 프레이밍 전송 (fallback)
+        mgr = None
+        try:
+            mgr = self.sender._require_mgr()  # type: ignore[attr-defined]
+        except Exception:
+            mgr = None
+        if mgr is None:
+            # 최후: 텍스트만 보냄(호환성), AppPDU 미적용 경고
+            try:
+                self.sender.send_line(line)
+            except Exception:
+                pass
+            self._append_log("[WARN] AppPDU API/manager 미탑재 → 텍스트만 전송됨(임시)")
+            return
+
+        # can_id 확보
+        try:
+            can_id = int(self.sender.can_id_11bit)  # type: ignore[attr-defined]
+        except Exception:
+            can_id = 0xC0
+
+        frames = self._local_frame_bytes(app_pdu)
+        for fr in frames:
+            if hasattr(mgr, "send_bytes"):
+                mgr.send_bytes(can_id, fr)      # type: ignore[attr-defined]
+            elif hasattr(mgr, "send_frame"):
+                mgr.send_frame(can_id, fr)      # type: ignore[attr-defined]
+            elif hasattr(mgr, "write"):
+                mgr.write(can_id, fr)           # type: ignore[attr-defined]
+            else:
+                raise RuntimeError("PCANManager에 전송 함수(send_bytes/send_frame/write)가 없습니다.")
+
     def _start_send(self, lines: List[str]):
         if self.sender is None:
             self._err("연결되어 있지 않습니다. 먼저 Connect 하세요.")
@@ -614,7 +698,7 @@ class MainWindow(QMainWindow):
         self.btnSendSelected.setEnabled(False)
         self.btnStop.setEnabled(True)
 
-        self.txWorker = SendWorker(self.sender, lines)
+        self.txWorker = SendWorker(self._send_one_line_app, lines)
         self.txWorker.progress.connect(self.progress.setValue)
         self.txWorker.lineSent.connect(lambda s: self._append_log(f"[TX] {s}"))
         self.txWorker.error.connect(self._on_worker_error)
@@ -626,12 +710,11 @@ class MainWindow(QMainWindow):
         self._reset_buttons()
 
     def _on_worker_done(self):
-        self._append_log("[INFO] 전송 완료]")
+        self._append_log("[INFO] 전송 완료")
         self._reset_buttons()
 
     def _reset_buttons(self):
         self.btnSendAll.setEnabled(True)
-        the_same = True
         self.btnSendSelected.setEnabled(True)
         self.btnStop.setEnabled(False)
         self.progress.setValue(100)
@@ -666,7 +749,7 @@ class MainWindow(QMainWindow):
         self.hist.append(cmd); self.hidx = len(self.hist)
         self.console.append(f">>> {cmd}")
         try:
-            self.sender.send_line(cmd)
+            self._send_one_line_app(cmd)
         except Exception as e:
             self.console.append(f"[ERR] {e}")
         finally:
@@ -676,13 +759,13 @@ class MainWindow(QMainWindow):
     def eventFilter(self, obj, ev):
         if obj is self.consoleInput and ev.type() == QEvent.Type.KeyPress:
             key = ev.key(); mod = ev.modifiers()
-            if key == Qt.Key.Key_L and (mod & Qt.KeyboardModifier.ControlModifier):
+            if key == Qt.Key_L and (mod & Qt.KeyboardModifier.ControlModifier):
                 self.console.clear(); self.consoleInput.clear(); return True
-            if key == Qt.Key.Key_Up:
+            if key == Qt.Key_Up:
                 if self.hist:
                     self.hidx = max(0, self.hidx - 1)
                     self.consoleInput.setText(self.hist[self.hidx]); return True
-            if key == Qt.Key.Key_Down:
+            if key == Qt.Key_Down:
                 if self.hist:
                     self.hidx = min(len(self.hist), self.hidx + 1)
                     if self.hidx == len(self.hist): self.consoleInput.clear()
