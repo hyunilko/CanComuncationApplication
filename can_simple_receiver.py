@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 """
-can_custom_receiver_simple.py
+can_simple_receiver.py
 
 - PCANManager를 공용으로 사용하여 CAN FD 프레임(최대 64B) 연속 수신
 - 수신 시 hexdump 프린트 + 파일 저장(패킷 간 1줄 공백)

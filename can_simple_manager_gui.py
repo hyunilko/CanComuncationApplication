@@ -2,12 +2,12 @@
 # -*- coding: utf-8 -*-
 
 """
-can_simple_manager_gui.py
+can_simple_manager_gui.py  (optimized for CanSimpleSender/Receiver + PCANManager)
 
 - PyQt6 GUI
-- TX: can_simple_sender.CanSimpleSender
-- RX: can_simple_receiver.CanSimpleReceiver (raw 64B 데이터 프레임)
-- 수신기(CanSimpleReceiver)가 hexdump 프린트 + "radar packet YYYY-MM-DD HH-mm-ss.log" 저장 수행
+- TX: can_simple_sender.CanSimpleSender (내부적으로 PCANManager 사용)
+- RX: can_simple_receiver.CanSimpleReceiver (TX의 같은 PCANManager 재사용)
+- 수신기는 hexdump 프린트 + "radar packet YYYY-MM-DD HH-mm-ss.log" 저장 수행
 - GUI는 수신 프레임을 스레드 세이프하게 콘솔에 표시(파일 저장은 중복 방지 위해 GUI에서 하지 않음)
 
 필요:
@@ -16,8 +16,9 @@ can_simple_manager_gui.py
 
 from __future__ import annotations
 from typing import List, Optional, Set
+import re
 
-import sys, os, re, binascii, time
+import sys, os, binascii
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QObject, QEvent
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QFileDialog, QMessageBox,
@@ -40,12 +41,6 @@ try:
 except Exception as e:
     CanSimpleReceiver = None  # type: ignore
     _rx_err = e
-
-# -------- PCANManager (fallback용) --------
-try:
-    from pcan_manager import PCANManager
-except Exception:
-    PCANManager = None  # type: ignore
 
 
 # ================= 송신 작업 스레드 =================
@@ -91,7 +86,7 @@ class SendWorker(QThread):
         self._stop = True
 
 
-# ================= 수신 폴링 워커 (콜백 실패 시 사용) =================
+# ================= 수신 폴링 워커 (RX 콜백 실패 시만 사용) =================
 class ReceiveWorker(QThread):
     rxText = pyqtSignal(str, int)      # 텍스트, CAN ID
     rxBinary = pyqtSignal(bytes, int)  # 바이너리, CAN ID
@@ -146,17 +141,14 @@ class MainWindow(QMainWindow):
         self.resize(1280, 860)
 
         if CanSimpleSender is None:
-            QMessageBox.critical(self, "오류", f"백엔드(can_custom_sender) import 실패: {_be_err}")
+            QMessageBox.critical(self, "오류", f"송신기(can_simple_sender) import 실패: {_be_err}")
         if CanSimpleReceiver is None:
-            QMessageBox.critical(self, "오류", f"수신기(can_custom_receiver_simple) import 실패: {_rx_err}")
+            QMessageBox.critical(self, "오류", f"수신기(can_simple_receiver) import 실패: {_rx_err}")
 
         self.txWorker: Optional[SendWorker] = None
         self.rxWorker: Optional[ReceiveWorker] = None
         self.sender: Optional["CanSimpleSender"] = None
         self._rx_receiver: Optional[CanSimpleReceiver] = None
-
-        self._rx_mgr_owned = False
-        self._rx_mgr = None
 
         # ---- UI 브릿지 ----
         self.uiBus = UiBridge()
@@ -193,7 +185,7 @@ class MainWindow(QMainWindow):
         row.addStretch(1)
         row.addWidget(self.btnConnect); row.addWidget(self.btnDisconnect)
 
-        gbConn = QGroupBox("Connection (TX: CanSimpleSender, RX: CanReceiverSimple)")
+        gbConn = QGroupBox("Connection (TX: CanSimpleSender, RX: CanSimpleReceiver)")
         layConn = QVBoxLayout(); layConn.addLayout(row); gbConn.setLayout(layConn)
 
         # ---------------- 중앙: 좌(리스트) / 우(에디터) ----------------
@@ -305,6 +297,12 @@ class MainWindow(QMainWindow):
                 ids.add(int(tok, 0))
         return ids or None
 
+    def _safe_call(self, obj, name, *args, **kwargs):
+        fn = getattr(obj, name, None)
+        if callable(fn):
+            return fn(*args, **kwargs)
+        return None
+
     # ================= 파일 열기 =================
     def on_open(self):
         path, _ = QFileDialog.getOpenFileName(
@@ -328,7 +326,7 @@ class MainWindow(QMainWindow):
     # ================= Connect/Disconnect =================
     def on_connect(self):
         if CanSimpleSender is None or CanSimpleReceiver is None:
-            self._err("백엔드/수신기 import 실패")
+            self._err("송신기/수신기 import 실패")
             return
 
         if self.sender is not None or self._rx_receiver is not None or (self.rxWorker is not None):
@@ -336,40 +334,29 @@ class MainWindow(QMainWindow):
             return
 
         try:
-            # 1) TX 연결
+            # 1) TX: CanSimpleSender 생성 + 연결
             self.sender = CanSimpleSender(
                 channel=self.edChannel.text().strip(),
                 bitrate_fd=self.edBitrate.text().strip(),
+                ifg_us=int(self.edIfg.value()),
+                auto_open=False,   # 아래에서 명시적으로 open/connect 호출
             )
-            self.sender.connect(ifg_us=int(self.edIfg.value()))
+            # connect(ifg_us=...) 우선
+            try:
+                self.sender.connect(ifg_us=int(self.edIfg.value()))
+            except TypeError:
+                # 구버전 시그니처 대응
+                self.sender.connect()
             self._append_log("[INFO] TX 연결 완료")
 
-            # 2) RX 매니저 재사용 or 새로 오픈
+            # 2) RX: 같은 PCANManager 재사용
             rx_mgr = None
             try:
-                rx_mgr = self.sender._require_mgr()  # type: ignore[attr-defined]
+                rx_mgr = self.sender._require_mgr()
             except Exception:
                 rx_mgr = None
-
             if rx_mgr is None:
-                if PCANManager is None:
-                    self._err("PCANManager 로드 실패: RX 매니저 생성 불가")
-                    try:
-                        self.sender.disconnect()
-                    except Exception:
-                        pass
-                    self.sender = None
-                    return
-                rx_mgr = PCANManager()
-                rx_mgr.open(self.edChannel.text().strip(),
-                            self.edBitrate.text().strip(),
-                            ifg_us=int(self.edIfg.value()))
-                self._rx_mgr_owned = True
-                self._append_log("[INFO] 별도 RX 매니저 오픈")
-            else:
-                self._rx_mgr_owned = False
-
-            self._rx_mgr = rx_mgr
+                raise RuntimeError("sender._require_mgr() 실패: PCANManager 획득 불가")
 
             # 3) 수신기 생성 (다중 ID)
             filter_ids = self._parse_filter_ids()
@@ -379,14 +366,14 @@ class MainWindow(QMainWindow):
                 one = None if not filter_ids else next(iter(filter_ids))
                 self._rx_receiver = CanSimpleReceiver(rx_mgr, filter_can_id=one)
 
-            # 4) 수신기가 사용할 로그 파일 경로 안내
+            # 4) 수신 로그 파일 경로 안내
             rx_log = getattr(self._rx_receiver, "_log_path", None)
             if rx_log:
                 self._append_log(f"[INFO] 수신 로그 파일: {rx_log}")
 
             # 5) 수신 콜백 → UI 브릿지를 통해 메인스레드로 전달
             def _on_complete_packet(data: bytes, can_id: int):
-                # hexdump/저장은 수신기 내부에서 이미 처리됨 → GUI는 표시만
+                # 수신기 내부에서 hexdump/저장을 이미 수행 → GUI는 표시만
                 try:
                     self.uiBus.rx_bin.emit(int(can_id), bytes(data))
                 except Exception:
@@ -450,17 +437,11 @@ class MainWindow(QMainWindow):
                 self._rx_receiver = None
         except Exception:
             pass
-        if self._rx_mgr_owned and self._rx_mgr is not None:
-            try:
-                if hasattr(self._rx_mgr, "close"):
-                    self._rx_mgr.close()  # type: ignore[attr-defined]
-            except Exception:
-                pass
-            self._rx_mgr_owned = False
-            self._rx_mgr = None
         try:
             if self.sender is not None:
-                self.sender.disconnect()
+                self._safe_call(self.sender, "stop_repl")
+                self._safe_call(self.sender, "disconnect")  # 내부에서 PCANManager close
+                self.sender = None
         except Exception:
             pass
         self.sender = None
@@ -480,24 +461,9 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
 
-        if self._rx_mgr_owned and self._rx_mgr is not None:
-            try:
-                if hasattr(self._rx_mgr, "close"):
-                    self._rx_mgr.close()  # type: ignore[attr-defined]
-            except Exception:
-                pass
-            self._rx_mgr_owned = False
-            self._rx_mgr = None
-
         if self.sender is not None:
-            try:
-                try:
-                    self.sender.stop_repl()
-                except Exception:
-                    pass
-                self.sender.disconnect()
-            except Exception as e:
-                self._err(str(e))
+            self._safe_call(self.sender, "stop_repl")
+            self._safe_call(self.sender, "disconnect")
             self.sender = None
 
         self.btnConnect.setEnabled(True)
